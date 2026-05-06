@@ -1,10 +1,11 @@
 from reasoning_core.template import Problem, Task, edict, Config
 from reasoning_core.utils import score_scalar
 import random
+from dataclasses import dataclass
 
 
-
-class nimConfig(Config):
+@dataclass
+class NimConfig(Config):
     min_nb_piles: int = 3
     max_nb_piles: int = 5
     min_piles_size: int = 5
@@ -19,7 +20,7 @@ class nimConfig(Config):
 
 class Nim(Task):
 
-    def __init__(self, config=nimConfig()):
+    def __init__(self, config=NimConfig()):
         super().__init__(config=config)
 
 
