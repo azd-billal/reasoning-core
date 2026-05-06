@@ -11,11 +11,11 @@ class nimConfig(Config):
     max_piles_size: int = 7
 
 
-def update(self,c):
-    self.min_nb_piles += c
-    self.max_nb_piles += c
-    self.min_piles_size += c
-    self.max_piles_size += c
+    def update(self,c):
+        self.min_nb_piles += c
+        self.max_nb_piles += c
+        self.min_piles_size += c
+        self.max_piles_size += c
 
 class Nim(Task):
 
