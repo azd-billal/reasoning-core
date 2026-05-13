@@ -28,7 +28,8 @@ def _parse_list(x):
 class Swig:
 
     def __init__(self, config=SwigConfig()):
-        super().__init__(config)
+        self.config = config
+        self.graph = nx.DiGraph()
 
 
     def _make_dag(self):
@@ -36,29 +37,33 @@ class Swig:
         n = self.config.num_nodes
         p = self.config.graph_density
 
-        # Génération de base
+
         G = nx.fast_gnp_random_graph(n, p, directed=True)
 
-        if G.number_of_edges() == 0 and n > 1:
-            return self._make_dag()
 
-        # Tri topologique aléatoire pour supprimer les cycles
         nodes = list(G.nodes())
         random.shuffle(nodes)
         order = {n: i for i, n in enumerate(nodes)}
         edges_to_remove = [(u, v) for u, v in G.edges() if order[u] >= order[v]]
         G.remove_edges_from(edges_to_remove)
 
-        return nx.convert_node_labels_to_integers(G)
+        if G.number_of_edges() == 0 and n > 1:
+            return self._make_dag()
 
-    def _render_graph(self,G):
+        self.graph = nx.convert_node_labels_to_integers(G)
+        return self.graph
+
+    def _render_graph(self):
         return " ".join(
-            f"Node {n} points to {', '.join(map(str, sorted(G.successors(n))))}."
-            if G.out_degree(n) > 0 else f"Node {n} has no outgoing links."
-            for n in sorted(G.nodes())
+            f"Node {n} points to {', '.join(map(str, sorted(self.graph.successors(n))))}."
+            if self.graph.out_degree(n) > 0 else f"Node {n} has no outgoing links."
+            for n in sorted(self.graph.nodes())
         )
 
-class SwigInterventionTask(Swig, Task):
+class SwigInterventionTask(Task):
+
+    def __init__(self, config=SwigConfig()):
+        super().__init__(config)
 
     def make_cot(self, G, target, intervention, descendants):
         lines = [
@@ -79,23 +84,24 @@ class SwigInterventionTask(Swig, Task):
         return "\n".join(lines)
 
     def generate(self):
-        G = self._make_dag()
+
+        swig_model = Swig(self.config)
+        G = swig_model._make_dag()
 
         normals_nodes = [n for n in G.nodes() if G.out_degree(n) > 0]
-        leafs_nodes = [n for n in G.nodes if G.out_degree(n) == 0]
+        leafs_nodes = [n for n in G.nodes() if G.out_degree(n) == 0]
 
         if (random.random() < self.config.leaf_intervention_prob) and leafs_nodes:
             query = random.choice(leafs_nodes)
         else:
-            query = random.choice(normals_nodes)
+            query = random.choice(normals_nodes) if normals_nodes else random.choice(list(G.nodes()))
 
         descendants = sorted(list(nx.descendants(G, query)))
-
         intervention = f"do({query})"
         answer = [f"{d}({intervention})" for d in descendants]
 
         metadata = {
-            "graph_description": self._render_graph(G),
+            "graph_description": swig_model._render_graph(),
             "query" : query,
             "intervention": intervention,
             "nodes": list(G.nodes()),
@@ -113,7 +119,7 @@ class SwigInterventionTask(Swig, Task):
             f"Consider the directed causal graph:\n\n{m['graph_description']}\n\n"
             f"We perform a surgical intervention on Node {m['query']} by forcing its value: {m['intervention']}.\n"
             f"List all new counterfactual variables created by this intervention.\n"
-            "The answer is a Python list of strings (e.g., ['1(do(0=1))']), or [] if no variables are affected."
+            "The answer is a Python list of strings (e.g., ['1(do(0))']), or [] if no variables are affected."
         )
 
     def score_answer(self, answer, entry):
@@ -123,4 +129,18 @@ class SwigInterventionTask(Swig, Task):
         if pred is None or true is None:
             return 0.0
 
-        return 1.0 if set(pred) == set(true) else 0.0
+        set_pred = set(pred)
+        set_true = set(true)
+
+        if not set_pred and not set_true:
+            return 1.0
+
+        if not set_pred or not set_true:
+            return 0.0
+
+        intersection = set_pred.intersection(true)
+        union = set_pred.union(true)
+
+        score = len(intersection) / len(union)
+
+        return round(score,2)
