@@ -2,6 +2,7 @@ from ast import literal_eval
 import networkx as nx
 import random
 from networkx.generators import directed
+from pgmpy.models import DiscreteBayesianNetwork
 from reasoning_core.template import Task, Problem, Config
 from dataclasses import dataclass
 
@@ -21,11 +22,13 @@ def _parse_list(x):
     except Exception:
         return None
 
-class Swig:
-
-    def __init__(self, config=SwigConfig()):
+class Swig(DiscreteBayesianNetwork):
+    """
+    La classe Swig hérite désormais de pgmpy.models.BayesianNetwork.
+    """
+    def __init__(self, config=SwigConfig(), ebunch=None):
+        super().__init__(ebunch)
         self.config = config
-        self.graph = nx.DiGraph()
 
     def _make_dag(self):
         n = self.config.num_nodes
@@ -42,55 +45,76 @@ class Swig:
         if G.number_of_edges() == 0 and n > 1:
             return self._make_dag()
 
-        self.graph = nx.convert_node_labels_to_integers(G)
-        return self.graph
+        G = nx.convert_node_labels_to_integers(G)
+
+        # Initialisation du BayesianNetwork courant
+        self.clear()
+        self.add_nodes_from(map(str, G.nodes()))
+        self.add_edges_from([(str(u), str(v)) for u, v in G.edges()])
+
+        return self
 
     def _render_graph(self):
         return " ".join(
-            f"Node {n} points to {', '.join(map(str, sorted(self.graph.successors(n))))}."
-            if self.graph.out_degree(n) > 0 else f"Node {n} has no outgoing links."
-            for n in sorted(self.graph.nodes())
+            f"Node {n} points to {', '.join(map(str, sorted(self.successors(n))))}."
+            if self.out_degree(n) > 0 else f"Node {n} has no outgoing links."
+            for n in sorted(self.nodes())
         )
 
     def transform_to_swig(self, interventions):
         """
-        Applique l'algorithme strict du SWIG pour des interventions multiples.
-        interventions: dictionnaire {str(node_id): intervention_val} (ex: {'0': 'x0', '1': 'x1'})
+        Applique l'algorithme du SWIG et retourne un pgmpy.models.BayesianNetwork
+        interventions: dictionnaire {str(node_id): intervention_val}
         """
-        swig_G = nx.DiGraph()
+        temp_G = nx.DiGraph()
         fixed_nodes = set(interventions.values())
 
-        # 1. Node Splitting & Redirection des arêtes
-        for u, v in self.graph.edges():
+        # 1. Node Splitting & Redirection des arêtes sur un graphe temporaire
+        for u, v in self.edges():
             str_u = str(u)
             str_v = str(v)
-            # Si la source est intervenue, l'arête part de sa moitié fixe, sinon de sa moitié aléatoire
             new_u = interventions[str_u] if str_u in interventions else str_u
-            # La destination reçoit toujours l'arête sur sa moitié aléatoire
             new_v = str_v
-            swig_G.add_edge(new_u, new_v)
+            temp_G.add_edge(new_u, new_v)
 
-        # Garantir la présence de tous les nœuds (y compris isolés ou moitiés de split)
-        for n in self.graph.nodes():
+        # Garantie de la présence de tous les nœuds
+        for n in self.nodes():
             str_n = str(n)
-            if str_n not in swig_G:
-                swig_G.add_node(str_n)
+            if str_n not in temp_G:
+                temp_G.add_node(str_n)
             if str_n in interventions:
                 fixed_val = interventions[str_n]
-                if fixed_val not in swig_G:
-                    swig_G.add_node(fixed_val)
+                if fixed_val not in temp_G:
+                    temp_G.add_node(fixed_val)
 
-        # 2. Labeling : Pour chaque nœud aléatoire, trouver ses ancêtres fixes
-        random_nodes = [n for n in swig_G.nodes() if n not in fixed_nodes]
-
+        # 2. Labeling : Détermination des étiquettes contrefactuelles
+        random_nodes = [n for n in temp_G.nodes() if n not in fixed_nodes]
+        node_mapping = {}
         counterfactuals = []
+
         for v in random_nodes:
-            ancestors = nx.ancestors(swig_G, v)
+            ancestors = nx.ancestors(temp_G, v)
             fixed_ancestors = ancestors.intersection(fixed_nodes)
             if fixed_ancestors:
-                # Si plusieurs interventions sont ancêtres, on les sépare par une virgule, triées
                 a_v = ",".join(sorted(list(fixed_ancestors)))
-                counterfactuals.append(f"{v}({a_v})")
+                new_label = f"{v}({a_v})"
+                node_mapping[v] = new_label
+                counterfactuals.append(new_label)
+            else:
+                node_mapping[v] = v
+
+        # 3. Instanciation du BayesianNetwork final de pgmpy
+        swig_G = DiscreteBayesianNetwork()
+
+        for u, v in temp_G.edges():
+            new_u = u if u in fixed_nodes else node_mapping[u]
+            new_v = v if v in fixed_nodes else node_mapping[v]
+            swig_G.add_edge(new_u, new_v)
+
+        for n in temp_G.nodes():
+            new_n = n if n in fixed_nodes else node_mapping[n]
+            if new_n not in swig_G:
+                swig_G.add_node(new_n)
 
         return swig_G, sorted(counterfactuals)
 
@@ -119,11 +143,9 @@ class SwigInterventionTask(Task):
         swig_model = Swig(self.config)
         G = swig_model._make_dag()
 
-        # Choix dynamique d'un nombre d'interventions simultanées (entre 1 et 2 pour ne pas surcharger)
         num_interventions = random.randint(1, min(2, len(G.nodes())))
         chosen_nodes = random.sample(list(G.nodes()), num_interventions)
 
-        # On force les clés en string pour éviter le crash d'EasyDict
         interventions = {str(n): f"x{n}" for n in sorted(chosen_nodes)}
 
         swig_G, answer = swig_model.transform_to_swig(interventions)
@@ -136,7 +158,6 @@ class SwigInterventionTask(Task):
             "cot": self.make_cot(interventions, answer)
         }
 
-        nx.draw(swig_G, with_labels=True, node_color='lightblue', font_weight='bold', node_size=800)
         return Problem(metadata=metadata, answer=str(answer))
 
     def prompt(self, m):
