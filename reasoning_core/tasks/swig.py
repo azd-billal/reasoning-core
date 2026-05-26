@@ -1,31 +1,20 @@
-
 from __future__ import annotations
 
 import copy
 import random
-import re
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field
 from itertools import product
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
 import networkx as nx
 import numpy as np
 
-import matplotlib
-try:
-    from IPython import get_ipython
-    if get_ipython() is None:
-        matplotlib.use("Agg")
-except (ImportError, AttributeError):
-    matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-
 from pgmpy.factors.discrete import TabularCPD
 from pgmpy.inference import VariableElimination
 from pgmpy.models import DiscreteBayesianNetwork
 
 from reasoning_core.tasks._causal_utils import get_random_DAG
-from reasoning_core.template import Task, Problem, Config
+from reasoning_core.template import Config
 
 @dataclass
 class SwigConfig(Config):
@@ -35,7 +24,6 @@ class SwigConfig(Config):
     cardinality: int = 2
     cpd_low: float = 0.1
     cpd_high: float = 0.9
-    intervention_value: int = 1
     random_seed: Optional[int] = None
     max_response_functions: int = 200_000
 
@@ -113,13 +101,6 @@ class _ResponseMechanism:
     probabilities: Dict[Tuple[Any, ...], Tuple[float, ...]]
 
 
-_MEDICAL_NODES = [
-    "Age", "Tabagisme", "Genetique", "Traitement", "Cancer",
-    "Stress", "Obesite", "Alcool", "Antecedents", "Activite",
-    "IMC", "Cholesterol", "Inflammation", "Immunite", "Hormones",
-]
-
-
 def _is_fixed_node(label: str) -> bool:
     return label.startswith("do(")
 
@@ -159,21 +140,6 @@ def _is_d_separator(G: nx.DiGraph, X: Set, Y: Set, Z: Set) -> bool:
     return _nx_d_sep(G, X, Y, Z)
 
 
-def _score_prob(answer: str, entry) -> float:
-    try:
-        match = re.search(r"_!_(.*?)_!_", answer)
-        pred_str = match.group(1).strip() if match else None
-        if pred_str is None:
-            m = re.search(r"\b(1(?:\.\d+)?|0(?:\.\d+)?)\b", answer)
-            pred_str = m.group() if m else None
-        if pred_str is None:
-            return 0.0
-        d = abs(float(pred_str) - float(entry.answer))
-        return 1.0 if d <= 0.05 else (0.5 if d <= 0.10 else 0.0)
-    except Exception:
-        return 0.0
-
-
 def _extract_graph(dag_wrapper) -> nx.DiGraph:
     if isinstance(dag_wrapper, nx.DiGraph):
         return dag_wrapper
@@ -202,25 +168,27 @@ class Swig(DiscreteBayesianNetwork):
         self,
         config: Optional[SwigConfig] = None,
         *,
+        ebunch: Optional[Iterable[Tuple[str, str]]] = None,
         source_bn: Optional["Swig"] = None,
         spec: Optional[SwigSpec] = None,
     ):
-        super().__init__()
+        super().__init__(ebunch)
         self.config = config if config is not None else SwigConfig()
-        if self.config.random_seed is not None:
-            random.seed(self.config.random_seed)
-            np.random.seed(self.config.random_seed)
+        self._rng = random.Random(self.config.random_seed)
+        self._np_rng = np.random.default_rng(self.config.random_seed)
 
-        self.source_bn = source_bn
+        self.source_bn = source_bn.copy() if source_bn is not None else None
         self.spec = spec if spec is not None else SwigSpec()
-        self.custom_cpds: Dict[str, TabularCPD] = {}
         self.cardinalities: Dict[str, int] = {}
         self.latents: Set[str] = set()
         self.trace: List[str] = []
 
 
     def generate_random_dag(
-        self, node_names: Optional[List[str]] = None, method: str = "erdos"
+        self,
+        node_names: Optional[List[str]] = None,
+        method: str = "erdos",
+        required_edges: Optional[Iterable[Tuple[str, str]]] = None,
     ) -> "Swig":
         n_nodes = len(node_names) if node_names is not None else self.config.num_nodes
         dag_wrapper = get_random_DAG(
@@ -234,19 +202,18 @@ class Swig(DiscreteBayesianNetwork):
         graph = _extract_graph(dag_wrapper)
         self.add_nodes_from(graph.nodes())
         self.add_edges_from(graph.edges())
-        raw_latents = set(getattr(dag_wrapper, "latents", set()))
-        self.latents = set(sorted(raw_latents)[: self.config.num_latents])
+        if required_edges:
+            self.add_edges_from((str(u), str(v)) for u, v in required_edges)
+        self.latents = {str(n) for n in getattr(dag_wrapper, "latents", set())}
 
         if not nx.is_directed_acyclic_graph(self):
             raise RuntimeError("Le DAG genere contient un cycle.")
         self._generate_cpds()
-        self.add_cpds(*self.custom_cpds.values())
         if not self.check_model():
             raise RuntimeError("Reseau Bayesien factuel structurellement mal forme.")
         return self
 
     def _generate_cpds(self) -> None:
-        self.custom_cpds = {}
         self.cardinalities = {}
         k = self.config.cardinality
         if k * self.config.cpd_low >= 1.0:
@@ -254,6 +221,7 @@ class Swig(DiscreteBayesianNetwork):
         base_dag = nx.DiGraph()
         base_dag.add_nodes_from(self.nodes())
         base_dag.add_edges_from(self.edges())
+        cpds: List[TabularCPD] = []
         for node in nx.topological_sort(base_dag):
             self.cardinalities[node] = k
             parents = list(base_dag.predecessors(node))
@@ -261,12 +229,12 @@ class Swig(DiscreteBayesianNetwork):
             num_combos = max(1, k ** num_parents)
             if k == 2:
                 if num_parents == 0:
-                    p = random.uniform(self.config.cpd_low, self.config.cpd_high)
+                    p = self._rng.uniform(self.config.cpd_low, self.config.cpd_high)
                     values = [[1 - p], [p]]
                 else:
                     v0, v1 = [], []
                     for _ in range(num_combos):
-                        p = random.uniform(self.config.cpd_low, self.config.cpd_high)
+                        p = self._rng.uniform(self.config.cpd_low, self.config.cpd_high)
                         v0.append(1 - p)
                         v1.append(p)
                     values = [v0, v1]
@@ -275,16 +243,17 @@ class Swig(DiscreteBayesianNetwork):
                 floor = self.config.cpd_low
                 scale = 1.0 - k * floor
                 for _ in range(num_combos):
-                    raw = np.random.dirichlet([1.0] * k)
+                    raw = self._np_rng.dirichlet([1.0] * k)
                     adjusted = raw * scale + floor
                     for i in range(k):
                         values[i].append(float(adjusted[i]))
             evidence = parents if num_parents > 0 else None
             evidence_card = [k] * num_parents if num_parents > 0 else None
-            self.custom_cpds[node] = TabularCPD(
+            cpds.append(TabularCPD(
                 variable=node, variable_card=k, values=values,
                 evidence=evidence, evidence_card=evidence_card,
-            )
+            ))
+        self.add_cpds(*cpds)
 
 
     @classmethod
@@ -364,6 +333,34 @@ class Swig(DiscreteBayesianNetwork):
         )
         return swig
 
+    @classmethod
+    def from_random(
+        cls,
+        *,
+        n_nodes: int = 4,
+        edge_prob: float = 0.5,
+        n_interventions: int = 1,
+        cardinality: int = 2,
+        seed: Optional[int] = None,
+    ) -> "Swig":
+        config = SwigConfig(
+            num_nodes=n_nodes,
+            graph_density=edge_prob,
+            num_latents=0,
+            cardinality=cardinality,
+            random_seed=seed,
+        )
+        source = cls(config)
+        source.generate_random_dag()
+        rng = random.Random(seed)
+        variables = [str(v) for v in source.nodes()]
+        chosen = rng.sample(variables, min(n_interventions, len(variables)))
+        interventions = {
+            var: rng.randrange(source.cardinalities.get(var, cardinality))
+            for var in chosen
+        }
+        return source.transform_to_swig(interventions)
+
     @staticmethod
     def _fixed_label(variable: str, value: Any) -> str:
         return f"do({variable}={value})"
@@ -382,19 +379,17 @@ class Swig(DiscreteBayesianNetwork):
     def _build_swig_cpds(self) -> None:
         if self.source_bn is None:
             raise ValueError("Cannot build SWIG CPDs without a source BN.")
-        self.custom_cpds = {}
         self.cardinalities = {}
         for source_var in self.spec.source_nodes:
             if source_var in self.source_bn.cardinalities:
                 self.cardinalities[source_var] = self.source_bn.cardinalities[source_var]
 
-
+        cpds: List[TabularCPD] = []
         for source_var, fixed_label in self.spec.fixed_of.items():
             states = self._states_for(self.source_bn, source_var)
             cpd = self._point_mass_cpd(fixed_label, states, self.spec.interventions[source_var])
             self.cardinalities[fixed_label] = self.cardinalities.get(source_var, len(states))
-            self.custom_cpds[fixed_label] = cpd
-
+            cpds.append(cpd)
 
         for source_var in self.spec.source_nodes:
             source_key = self._source_key_in_source(source_var)
@@ -406,11 +401,9 @@ class Swig(DiscreteBayesianNetwork):
                     f"Swig currently copies TabularCPD mechanisms only; "
                     f"got {type(source_cpd)!r} for {source_var}."
                 )
-            redirected = self._redirect_cpd(source_cpd)
-            swig_var = self.spec.random_of[source_var]
-            self.custom_cpds[swig_var] = redirected
+            cpds.append(self._redirect_cpd(source_cpd))
 
-        self.add_cpds(*self.custom_cpds.values())
+        self.add_cpds(*cpds)
         if not self.check_model():
             raise RuntimeError("SWIG Bayesian network is structurally malformed.")
 
@@ -493,16 +486,18 @@ class Swig(DiscreteBayesianNetwork):
         return list(range(cardinality))
 
     def transform_to_swig(self, interventions: Dict[str, int]) -> "Swig":
+        normalized: Dict[str, int] = {}
         for var, val in interventions.items():
             if var not in self.nodes():
                 raise ValueError(f"Intervention impossible : variable '{var}' absente du DAG G.")
             card = self.cardinalities.get(var, 2)
-            if not isinstance(val, int) or not (0 <= val < card):
+            if not isinstance(val, (int, np.integer)) or not (0 <= int(val) < card):
                 raise ValueError(
                     f"La valeur d'intervention pour '{var}' doit etre un entier "
                     f"dans [0, {card - 1}], recu {val!r}."
                 )
-        return Swig.from_bn(self, interventions, copy_cpds=True)
+            normalized[var] = int(val)
+        return Swig.from_bn(self, normalized, copy_cpds=True)
 
     def random_node_for(self, source_var: Any) -> str:
         return self.spec.random_of[str(source_var)]
@@ -529,13 +524,18 @@ class Swig(DiscreteBayesianNetwork):
         )
 
     def query_probability(
-        self, target: str, state: int = 1, evidence: Optional[Dict[str, int]] = None
+        self, target: str, state: Any = 1, evidence: Optional[Dict[str, int]] = None
     ) -> float:
         if target not in self.nodes():
             raise ValueError(f"La variable cible '{target}' n'est pas resoluble.")
         inf = VariableElimination(self)
         result = inf.query(variables=[target], evidence=evidence, show_progress=False)
-        return float(round(result.values[state], 6))
+        target_states = list(result.state_names[target])
+        if state not in target_states:
+            raise ValueError(
+                f"state {state!r} not in target states {target_states!r} for variable {target!r}"
+            )
+        return float(round(result.values[target_states.index(state)], 6))
 
     def check_d_separation(
         self,
@@ -546,7 +546,7 @@ class Swig(DiscreteBayesianNetwork):
         observed = list(observed_vars or [])
         if forbid_latents:
             for obs in observed:
-                base = str(_get_base_variable(str(obs)) if not isinstance(obs, str) else obs)
+                base = _get_base_variable(str(obs))
                 if base in self.latents:
                     raise ValueError(
                         f"Rupture d'observabilite : impossible de conditionner "
@@ -556,8 +556,9 @@ class Swig(DiscreteBayesianNetwork):
             self, {treatment}, {target}, set(observed)
         )
 
+    @staticmethod
     def counterfactual_d_separation(
-        self, graph: nx.DiGraph, X: Set, Y: Set, Z: Set
+        graph: nx.DiGraph, X: Set, Y: Set, Z: Set
     ) -> bool:
         X_set, Y_set, Z_set = set(X), set(Y), set(Z)
         random_vars, _ = _partition_nodes(graph)
@@ -906,8 +907,31 @@ class Swig(DiscreteBayesianNetwork):
         )
 
     def cpds_text(self) -> str:
-        all_cpds = dict(self.custom_cpds)
-        return "\n".join(str(all_cpds[n]) for n in sorted(all_cpds.keys()))
+        cpds_by_var = {str(cpd.variable): cpd for cpd in self.get_cpds()}
+        return "\n\n".join(self._cpd_to_text(cpds_by_var[n]) for n in sorted(cpds_by_var.keys()))
+
+    @staticmethod
+    def _cpd_to_text(cpd: TabularCPD, n_round: int = 6) -> str:
+        child = str(cpd.variable)
+        child_states = Swig._cpd_states(cpd, cpd.variable, int(cpd.variable_card))
+        parent_vars = list(cpd.variables[1:])
+        parent_cards = [int(c) for c in cpd.cardinality[1:]]
+        parent_states_list = [
+            Swig._cpd_states(cpd, p, c) for p, c in zip(parent_vars, parent_cards)
+        ]
+        values = cpd.get_values()
+        if not parent_vars:
+            return "\n".join(
+                f"P({child}={state}) = {round(float(values[i, 0]), n_round)}"
+                for i, state in enumerate(child_states)
+            )
+        lines: List[str] = []
+        for col, cfg in enumerate(product(*parent_states_list)):
+            cond_str = ", ".join(f"{str(p)}={v}" for p, v in zip(parent_vars, cfg))
+            for i, state in enumerate(child_states):
+                p = round(float(values[i, col]), n_round)
+                lines.append(f"P({child}={state} | {cond_str}) = {p}")
+        return "\n".join(lines)
 
     def validate_swig_metadata(self) -> None:
         graph_nodes = set(map(str, self.nodes()))
@@ -975,6 +999,8 @@ class Swig(DiscreteBayesianNetwork):
         swig.add_nodes_from(data.get("nodes", ()))
         swig.add_edges_from(data.get("edges", ()))
         swig.trace = list(data.get("trace", ()))
+        if swig.source_bn is not None:
+            swig._build_swig_cpds()
         return swig
 
     def copy(self) -> "Swig":
@@ -986,14 +1012,10 @@ class Swig(DiscreteBayesianNetwork):
         copied.add_nodes_from(self.nodes())
         copied.add_edges_from(self.edges())
         copied.trace = list(self.trace)
-        copied.custom_cpds = {k: v.copy() for k, v in self.custom_cpds.items()}
         copied.cardinalities = dict(self.cardinalities)
         copied.latents = set(self.latents)
         for cpd in self.get_cpds():
-            try:
-                copied.add_cpds(cpd.copy())
-            except Exception:
-                pass
+            copied.add_cpds(cpd.copy())
         return copied
 
 class SwigCounterfactualEngine:
@@ -1010,6 +1032,11 @@ class SwigCounterfactualEngine:
     def __init__(self, swig: Swig, *, max_response_functions: int = 200_000):
         if swig.source_bn is None:
             raise ValueError("Counterfactual inference requires swig.source_bn.")
+        if swig.source_bn.latents or swig.latents:
+            raise ValueError(
+                "SwigCounterfactualEngine assumes a Markovian (latent-free) SCM; "
+                "the source network contains latent confounders."
+            )
         self.swig = swig
         self.max_response_functions = max_response_functions
         self.mechanisms = self._build_mechanisms()
@@ -1027,7 +1054,28 @@ class SwigCounterfactualEngine:
                 else:
                     n_choices = len(probs)
                 size *= n_choices
+                if size > self.max_response_functions:
+                    return size
         return size
+
+    def explain_query(
+        self,
+        target: Any,
+        factual_evidence: Optional[Mapping[Any, Any]] = None,
+    ) -> str:
+        target_source = self._target_source(target)
+        target_node = self.swig.random_node_for(target_source)
+        evidence = self._normalize_factual_evidence(factual_evidence or {})
+        response_space = self.response_space_size()
+        self.trace = [
+            f"Goal: compute distribution for {target_node}.",
+            "Semantics: canonical discrete response-table SCM induced by the source BN CPDs.",
+            f"Response functions to enumerate: {response_space}.",
+            f"Abduction: condition response tables on factual evidence {evidence}.",
+            f"Action: apply interventions {self.swig.spec.interventions}.",
+            f"Prediction: read source variable {target_source} in the intervened world.",
+        ]
+        return "\n".join(self.trace)
 
     def query(
         self,
@@ -1277,447 +1325,10 @@ class SwigCounterfactualEngine:
         return float(cpd.get_values()[child_index, column_index])
 
 
-def draw_swig(
-    swig_graph: nx.DiGraph,
-    swig_bn: Optional[DiscreteBayesianNetwork] = None,
-    latents: Optional[Set[str]] = None,
-    title: str = "SWIG",
-    ax=None,
-):
-    latents = latents or set()
-    marginals: Dict[Any, float] = {}
-    if swig_bn is not None:
-        try:
-            inf = VariableElimination(swig_bn)
-            for node in swig_graph.nodes():
-                if _is_fixed_node(str(node)):
-                    continue
-                bn_name = str(node)
-                if bn_name in swig_bn.nodes():
-                    try:
-                        q = inf.query(variables=[bn_name], show_progress=False)
-                        marginals[node] = float(round(q.values[1], 3))
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-
-    pos = nx.circular_layout(swig_graph)
-    labels = {}
-    colors = []
-    for node in swig_graph.nodes():
-        base = str(_get_base_variable(str(node)))
-        if _is_fixed_node(str(node)):
-            color = "lightgreen"
-        elif base in latents:
-            color = "lightcoral"
-        else:
-            color = "lightblue"
-        colors.append(color)
-        label = str(node)
-        if node in marginals:
-            label += f"\n{marginals[node]:.3f}"
-        labels[node] = label
-
-    standalone = ax is None
-    if standalone:
-        fig, ax = plt.subplots(figsize=(12, 10))
-    ax.set_title(title, fontsize=14, fontweight="bold")
-    nx.draw(
-        swig_graph, pos, ax=ax, labels=labels, with_labels=True,
-        node_color=colors, node_size=3000, font_size=7,
-        font_weight="bold", arrows=True, arrowsize=15,
-    )
-    if standalone:
-        plt.tight_layout()
-        plt.show()
-
-
-def draw_dag_and_swig(
-    swig_model: Swig,
-    swig_graph: nx.DiGraph,
-    swig_bn: Optional[DiscreteBayesianNetwork] = None,
-):
-    fig, (ax_dag, ax_swig) = plt.subplots(1, 2, figsize=(18, 8))
-    dag_marginals: Dict[Any, float] = {}
-    try:
-        inf = VariableElimination(swig_model)
-        for node in swig_model.nodes():
-            try:
-                q = inf.query(variables=[node], show_progress=False)
-                dag_marginals[node] = float(round(q.values[1], 3))
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    pos = nx.circular_layout(swig_model)
-    labels = {}
-    for n in swig_model.nodes():
-        label = str(n)
-        if n in dag_marginals:
-            label += f"\n{dag_marginals[n]:.3f}"
-        labels[n] = label
-    colors = [
-        "lightcoral" if n in swig_model.latents else "lightblue"
-        for n in swig_model.nodes()
-    ]
-    ax_dag.set_title("DAG Original G  --  P(X=1)", fontsize=14, fontweight="bold")
-    nx.draw(
-        swig_model, pos, ax=ax_dag, labels=labels, with_labels=True,
-        node_color=colors, node_size=3000, font_size=7,
-        font_weight="bold", arrows=True, arrowsize=15,
-    )
-    draw_swig(
-        swig_graph, swig_bn=swig_bn, latents=swig_model.latents,
-        title="SWIG G(a)  --  P(X(a)=1)", ax=ax_swig,
-    )
-    plt.tight_layout()
-    plt.show()
-
-
-def draw_dag_and_two_swigs(
-    swig_model: Swig,
-    swig_graph_t1: nx.DiGraph,
-    swig_graph_t0: nx.DiGraph,
-    swig_bn_t1: Optional[DiscreteBayesianNetwork] = None,
-    swig_bn_t0: Optional[DiscreteBayesianNetwork] = None,
-):
-    fig, (ax_dag, ax_t1, ax_t0) = plt.subplots(1, 3, figsize=(27, 8))
-    dag_marginals: Dict[Any, float] = {}
-    try:
-        inf = VariableElimination(swig_model)
-        for node in swig_model.nodes():
-            try:
-                q = inf.query(variables=[node], show_progress=False)
-                dag_marginals[node] = float(round(q.values[1], 3))
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    pos = nx.circular_layout(swig_model)
-    labels = {
-        n: (str(n) + f"\n{dag_marginals[n]:.3f}" if n in dag_marginals else str(n))
-        for n in swig_model.nodes()
-    }
-    colors = [
-        "lightcoral" if n in swig_model.latents else "lightblue"
-        for n in swig_model.nodes()
-    ]
-    ax_dag.set_title("DAG Original G  --  P(X=1)", fontsize=14, fontweight="bold")
-    nx.draw(
-        swig_model, pos, ax=ax_dag, labels=labels, with_labels=True,
-        node_color=colors, node_size=3000, font_size=7,
-        font_weight="bold", arrows=True, arrowsize=15,
-    )
-    draw_swig(
-        swig_graph_t1, swig_bn=swig_bn_t1, latents=swig_model.latents,
-        title="SWIG G(do=1)  --  P(X(1)=1)", ax=ax_t1,
-    )
-    draw_swig(
-        swig_graph_t0, swig_bn=swig_bn_t0, latents=swig_model.latents,
-        title="SWIG G(do=0)  --  P(X(0)=1)", ax=ax_t0,
-    )
-    plt.tight_layout()
-    plt.show()
-
-
-class CancerEmpiricalTask(Task):
-    """Tache medicale empirique avec vocabulaire clinique."""
-
-    def __init__(self, config: Optional[SwigConfig] = None):
-        cfg = copy.deepcopy(config) if config is not None else SwigConfig()
-        cfg.num_latents = 0
-        cfg.num_nodes = 5
-        super().__init__(cfg)
-
-    def generate(self):
-        model = Swig(self.config)
-        n = min(self.config.num_nodes, len(_MEDICAL_NODES))
-        medical_nodes = _MEDICAL_NODES[:n]
-        model.generate_random_dag(node_names=medical_nodes)
-        v_star = self.config.intervention_value
-        v_star = v_star if v_star < model.cardinalities.get("Traitement", 2) else 0
-        interventions = {"Traitement": v_star}
-        swig_model = model.transform_to_swig(interventions)
-        counterfactuals = swig_model.counterfactual_nodes()
-        if not counterfactuals:
-            return None
-        cancer_targets = [c for c in counterfactuals if c.startswith("Cancer")]
-        if not cancer_targets:
-            return None
-        target = cancer_targets[0]
-        try:
-            df = model.simulate(n_samples=5000, show_progress=False)
-        except Exception:
-            return None
-        freq = df.value_counts().reset_index(name="count").to_string(index=False)
-        true_prob = swig_model.query_probability(target, state=1)
-        metadata = {
-            "graph_description": model.render_graph_description(),
-            "interventions": interventions,
-            "target": target,
-            "dataset_summary": freq,
-            "exact_theoretical_prob": true_prob,
-            "cot": f"Clinical truth: P({target}=1) = {true_prob}",
-        }
-        return Problem(metadata=metadata, answer=str(true_prob))
-
-    def prompt(self, m):
-        v_star = list(m["interventions"].values())[0]
-        return (
-            f"Clinical graph:\n{m['graph_description']}\n\n"
-            f"5000-patient data:\n```\n{m['dataset_summary']}\n```\n\n"
-            f"Force Traitement={v_star}. Estimate P({m['target']}=1) via empirical g-formula.\n"
-            f"Wrap answer: _!_value_!_"
-        )
-
-    def score_answer(self, answer, entry):
-        return _score_prob(answer, entry)
-
-
-class CounterfactualPatientTask(Task):
-    """Tache contrefactuelle individualisee : patient specifique."""
-
-    def __init__(self, config: Optional[SwigConfig] = None):
-        cfg = copy.deepcopy(config) if config is not None else SwigConfig()
-        cfg.num_latents = 0
-        cfg.num_nodes = 5
-        super().__init__(cfg)
-
-    def generate(self):
-        model = Swig(self.config)
-        n = min(self.config.num_nodes, len(_MEDICAL_NODES))
-        medical_nodes = _MEDICAL_NODES[:n]
-        model.generate_random_dag(node_names=medical_nodes)
-
-        try:
-            df = model.simulate(n_samples=1, show_progress=False)
-        except Exception:
-            return None
-        patient_row = df.iloc[0]
-        obs = {col: int(patient_row[col]) for col in medical_nodes if col in patient_row.index}
-        obs_treatment = obs.get("Traitement", 0)
-        cf_treatment = 1 - obs_treatment
-        interventions = {"Traitement": cf_treatment}
-        swig_model = model.transform_to_swig(interventions)
-        counterfactuals = swig_model.counterfactual_nodes()
-        cancer_targets = [c for c in counterfactuals if c.startswith("Cancer")]
-        if not cancer_targets:
-            return None
-        target = cancer_targets[0]
-        treatment_descendants = nx.descendants(model, "Traitement") | {"Traitement"}
-        pre_treat_vars = [
-            n for n in model.nodes()
-            if n not in treatment_descendants and str(n) not in model.latents
-        ]
-        evidence = {
-            str(v): obs[str(v)]
-            for v in pre_treat_vars
-            if str(v) in obs and str(v) in swig_model.nodes()
-        }
-
-
-        cf_prob = None
-        engine = None
-        try:
-            engine = SwigCounterfactualEngine(
-                swig_model, max_response_functions=self.config.max_response_functions
-            )
-            if engine.response_space_size() <= self.config.max_response_functions:
-                # Build factual evidence matching the patient
-                factual_ev = {
-                    str(v): obs[str(v)]
-                    for v in model.nodes()
-                    if str(v) in obs and str(v) not in model.latents
-                }
-                dist = engine.query(target, factual_evidence=factual_ev)
-                cf_prob = dist.get(1, 0.0)
-        except Exception:
-            pass
-
-
-        if cf_prob is None:
-            try:
-                cf_prob = swig_model.query_probability(
-                    target, state=1, evidence=evidence or None
-                )
-            except Exception:
-                return None
-
-        pre_str = ", ".join(f"{k}={v}" for k, v in evidence.items()) if evidence else "\u2205"
-        metadata = {
-            "graph_description": model.render_graph_description(),
-            "patient_obs": obs,
-            "obs_treatment": obs_treatment,
-            "cf_treatment": cf_treatment,
-            "pre_treatment_vars": [str(v) for v in pre_treat_vars],
-            "evidence": evidence,
-            "target": target,
-            "interventions": interventions,
-            "exact_theoretical_prob": cf_prob,
-            "method": "exact_counterfactual" if engine and engine.last_evidence_probability is not None else "interventional",
-            "cot": f"P({target}=1 | {pre_str}) = {cf_prob:.6f}",
-        }
-        return Problem(metadata=metadata, answer=str(cf_prob))
-
-    def prompt(self, m):
-        obs = m["patient_obs"]
-        obs_str = ", ".join(f"${k}={v}$" for k, v in obs.items())
-        cf, obs_t = m["cf_treatment"], m["obs_treatment"]
-        target = m["target"]
-        ev_str = (
-            ", ".join(f"${k}={v}$" for k, v in m["evidence"].items())
-            if m["evidence"] else "no pre-treatment covariates"
-        )
-        return (
-            f"Causal graph:\n{m['graph_description']}\n\n"
-            f"Observed patient: {obs_str}.\n"
-            f"This patient received $\\text{{Traitement}}={obs_t}$ "
-            f"and had $\\text{{Cancer}}={obs['Cancer']}$.\n\n"
-            f"Counterfactual question: if we had forced $\\text{{Traitement}}={cf}$ "
-            f"in the past, what is $P({target}=1 \\mid {ev_str})$ for this specific patient?\n\n"
-            f"Wrap your answer: _!_value_!_"
-        )
-
-    def score_answer(self, answer, entry):
-        return _score_prob(answer, entry)
-
-
-class ProbabilityOfNecessityTask(Task):
-    """Tache de Probabilite de Necessite (PN) avec inference contrefactuelle exacte."""
-
-    def __init__(self, config: Optional[SwigConfig] = None):
-        cfg = copy.deepcopy(config) if config is not None else SwigConfig()
-        cfg.num_latents = 0
-        cfg.num_nodes = 5
-        super().__init__(cfg)
-
-    def generate(self):
-        model = Swig(self.config)
-        n = min(self.config.num_nodes, len(_MEDICAL_NODES))
-        medical_nodes = _MEDICAL_NODES[:n]
-        model.generate_random_dag(node_names=medical_nodes)
-
-        swig_t1 = model.transform_to_swig({"Traitement": 1})
-        swig_t0 = model.transform_to_swig({"Traitement": 0})
-        cf_t1 = swig_t1.counterfactual_nodes()
-        cf_t0 = swig_t0.counterfactual_nodes()
-        cancer_t1 = [c for c in cf_t1 if c.startswith("Cancer")]
-        cancer_t0 = [c for c in cf_t0 if c.startswith("Cancer")]
-        if not cancer_t1 or not cancer_t0:
-            return None
-        target_t1 = cancer_t1[0]
-        target_t0 = cancer_t0[0]
-
-        treatment_descendants = nx.descendants(model, "Traitement") | {"Traitement"}
-        pre_treat_vars = [
-            n for n in model.nodes()
-            if n not in treatment_descendants and str(n) not in model.latents
-        ]
-
-        try:
-            df = model.simulate(n_samples=500, show_progress=False)
-        except Exception:
-            return None
-        matching = df[(df.get("Traitement", -1) == 1) & (df.get("Cancer", -1) == 1)]
-        if matching.empty:
-            return None
-        patient_row = matching.iloc[0]
-        obs = {col: int(patient_row[col]) for col in medical_nodes if col in patient_row.index}
-
-        swig_nodes_t1 = set(swig_t1.nodes())
-        evidence = {
-            str(v): obs[str(v)]
-            for v in pre_treat_vars
-            if str(v) in obs and str(v) in swig_nodes_t1
-        }
-
-        p1_interv = swig_t1.query_probability(target_t1, state=1, evidence=evidence or None)
-        p0_interv = swig_t0.query_probability(target_t0, state=1, evidence=evidence or None)
-
-        if p1_interv <= 0:
-            return None
-
-        # Exact counterfactual PN via engine (if model is small enough)
-        pn = None
-        method = "interventional_approximation"
-        try:
-            engine = SwigCounterfactualEngine(
-                swig_t1, max_response_functions=self.config.max_response_functions
-            )
-            if engine.response_space_size() <= self.config.max_response_functions:
-                factual_ev = {
-                    str(k): v for k, v in obs.items()
-                    if str(k) in model.nodes() and str(k) not in model.latents
-                }
-                factual_ev["Traitement"] = 1
-                factual_ev["Cancer"] = 1
-
-                engine_t0 = SwigCounterfactualEngine(
-                    swig_t0, max_response_functions=self.config.max_response_functions
-                )
-                dist = engine_t0.query("Cancer", factual_evidence=factual_ev)
-                p_cancer0_cf = dist.get(0, 0.0)
-                pn = round(p_cancer0_cf, 6)
-                method = "exact_counterfactual"
-        except Exception:
-            pass
-
-        if pn is None:
-            pn = round(max(0.0, p1_interv - p0_interv) / p1_interv, 6)
-
-        pre_str = ", ".join(f"{k}={v}" for k, v in evidence.items()) if evidence else "\u2205"
-        metadata = {
-            "graph_description": model.render_graph_description(),
-            "graph_cpds": model.cpds_text(),
-            "patient_obs": obs,
-            "pre_treatment_vars": [str(v) for v in pre_treat_vars],
-            "evidence": evidence,
-            "target_t1": target_t1,
-            "target_t0": target_t0,
-            "p_cancer_do_t1": p1_interv,
-            "p_cancer_do_t0": p0_interv,
-            "exact_theoretical_prob": pn,
-            "method": method,
-            "cot": (
-                f"Step 1: Read the causal graph and CPDs to identify the parents of Cancer "
-                f"in each intervened world.\n"
-                f"Step 2: Compute P(Cancer=1 | do(Traitement=1), {pre_str}) = {p1_interv:.6f} "
-                f"by marginalizing over the SWIG(do=1) distribution.\n"
-                f"Step 3: Compute P(Cancer=1 | do(Traitement=0), {pre_str}) = {p0_interv:.6f} "
-                f"by marginalizing over the SWIG(do=0) distribution.\n"
-                f"Step 4: PN = {pn:.6f} (method: {method})"
-            ),
-        }
-        draw_dag_and_two_swigs(model, swig_t1, swig_t0, swig_t1, swig_t0)
-        return Problem(metadata=metadata, answer=str(pn))
-
-    def prompt(self, m):
-        obs = m["patient_obs"]
-        obs_str = ", ".join(f"{k}={v}" for k, v in obs.items())
-        ev_str = (
-            ", ".join(f"{k}={v}" for k, v in m["evidence"].items())
-            if m["evidence"] else "no pre-treatment covariates"
-        )
-        return (
-            f"Causal graph structure:\n{m['graph_description']}\n\n"
-            f"Conditional probability tables:\n{m['graph_cpds']}\n\n"
-            f"Observed patient: {obs_str}.\n"
-            f"This patient received Traitement=1 and developed Cancer=1.\n\n"
-            f"Task: Compute the Probability of Necessity (PN) -- the probability that "
-            f"this patient's cancer would NOT have occurred had they NOT received treatment.\n\n"
-            f"Formally: PN = P(Cancer(Traitement=0)=0 | Traitement=1, Cancer=1, {ev_str})\n\n"
-            f"Under the independent background noise assumption:\n"
-            f"  PN = max(0, p1 - p0) / p1\n"
-            f"where p1 = P(Cancer=1 | do(Traitement=1), {ev_str})\n"
-            f"  and p0 = P(Cancer=1 | do(Traitement=0), {ev_str})\n\n"
-            f"Compute p1 and p0 from the causal graph and CPDs above "
-            f"(intervening on Traitement removes all incoming edges to it), "
-            f"then apply the formula.\n"
-            f"Wrap your final answer: _!_value_!_"
-        )
-
-    def score_answer(self, answer, entry):
-        return _score_prob(answer, entry)
+__all__ = [
+    "Swig",
+    "SwigConfig",
+    "SwigSpec",
+    "SwigNodeInfo",
+    "SwigCounterfactualEngine",
+]
