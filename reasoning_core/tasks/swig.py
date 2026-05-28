@@ -1324,6 +1324,18 @@ class SwigCounterfactualEngine:
             column_index += parent_states.index(parent_value)
         return float(cpd.get_values()[child_index, column_index])
 
+def compute_cbn_225(self, target, intervention, factual_evidence=None, *, n_round=None):
+    """
+    Calcule la distribution contrefactuelle d'une variable cible
+    dans le cadre CBN2.25.
+
+    target : variable à prédire dans le monde contrefactuel
+    intervention : action imposée, par exemple {"A": "a"}
+    factual_evidence : observations du monde réel, par exemple {"B": "b", "C": "c"}
+    n_round : arrondi optionnel des probabilités
+    """
+    pass
+
 
 __all__ = [
     "Swig",
