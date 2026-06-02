@@ -154,23 +154,61 @@ def _extract_graph(dag_wrapper) -> nx.DiGraph:
     return nx.DiGraph(dag_wrapper)
 
 
-class Swig(DiscreteBayesianNetwork):
-    """
-    Reseau Bayesian Causal etendu supportant le formalisme SWIG (Robins & Richardson).
 
-    Deux modes d'utilisation :
-    1. Mode source : `generate_random_dag()` cree un DAG causal factuel.
-    2. Mode SWIG  : `transform_to_swig()` transforme ce DAG en SWIG avec
-       labels lisibles (do(X=v), Y(X=v)) et metadonnees SwigSpec.
+class _Factor:
+    """Facteur symbolique P(...) utilise par la g-computation."""
+    __slots__ = ("expr", "vars")
+    def __init__(self, expr, vars_):
+        self.expr = expr
+        self.vars = vars_
+
+class Swig(DiscreteBayesianNetwork):
+    """Reseau bayesien causal etendu materialisant un SWIG (Single-World
+    Intervention Graph, Richardson & Robins 2013).
+
+    Un SWIG s'obtient en "scindant" (node-splitting) chaque variable traitee du
+    DAG causal : le sommet est dedouble en un noeud FIXE qui porte la valeur
+    d'intervention (label `do(X=v)`) et un noeud ALEATOIRE qui porte la reponse
+    contrefactuelle (label `Y(X=v)`). Le graphe obtenu represente un seul monde
+    contrefactuel (single-world), d'ou son interet pour lire l'identifiabilite
+    par d-separation.
+
+    Cette classe herite de pgmpy.DiscreteBayesianNetwork : elle est donc un vrai
+    reseau bayesien (structure + CPDs), mais enrichi des labels lisibles et des
+    metadonnees SWIG (objet SwigSpec : interventions appliquees, partition
+    fixe/aleatoire, etc.).
+
+    Cycle de vie en deux temps :
+      1. Mode SOURCE (DAG factuel) :
+         - generate_random_dag()  : tire aleatoirement un DAG causal et ses CPDs ;
+         - from_bn()              : construit l'instance a partir d'un reseau existant.
+      2. Mode SWIG (monde contrefactuel) :
+         - transform_to_swig(interventions) : applique le node-splitting et rend
+           une NOUVELLE instance Swig portant les labels do(X=v) / Y(X=v) et le
+           SwigSpec correspondant. L'instance source reste accessible via
+           `source_bn` (necessaire au calcul numerique des contrefactuels).
+
+    Methodes principales :
+      - query_probability(...)        : interroge une probabilite dans le reseau.
+      - check_d_separation(X, Y, Z)   : test de d-separation sur le graphe.
+      - counterfactual_nodes()        : liste les noeuds aleatoires contrefactuels Y(x).
+      - random_node_for(var) / random_node_for : retrouve le noeud aleatoire d'une
+                                        variable de base.
+      - render_graph_description() / cpds_text() / to_nl() : serialisations
+        textuelles (description du graphe, tables de probabilite, enonce en
+        langage naturel) destinees a la generation de taches.
+      - copy()                        : copie profonde de l'instance.
+
+    Reference : SWIG-1.pdf (Richardson & Robins, 2013).
     """
 
     def __init__(
-        self,
-        config: Optional[SwigConfig] = None,
-        *,
-        ebunch: Optional[Iterable[Tuple[str, str]]] = None,
-        source_bn: Optional["Swig"] = None,
-        spec: Optional[SwigSpec] = None,
+            self,
+            config: Optional[SwigConfig] = None,
+            *,
+            ebunch: Optional[Iterable[Tuple[str, str]]] = None,
+            source_bn: Optional["Swig"] = None,
+            spec: Optional[SwigSpec] = None,
     ):
         super().__init__(ebunch)
         self.config = config if config is not None else SwigConfig()
@@ -185,10 +223,10 @@ class Swig(DiscreteBayesianNetwork):
 
 
     def generate_random_dag(
-        self,
-        node_names: Optional[List[str]] = None,
-        method: str = "erdos",
-        required_edges: Optional[Iterable[Tuple[str, str]]] = None,
+            self,
+            node_names: Optional[List[str]] = None,
+            method: str = "erdos",
+            required_edges: Optional[Iterable[Tuple[str, str]]] = None,
     ) -> "Swig":
         n_nodes = len(node_names) if node_names is not None else self.config.num_nodes
         dag_wrapper = get_random_DAG(
@@ -258,12 +296,13 @@ class Swig(DiscreteBayesianNetwork):
 
     @classmethod
     def from_bn(
-        cls,
-        bn: "Swig",
-        interventions: Mapping[Any, Any],
-        *,
-        copy_cpds: bool = True,
+            cls,
+            bn: "Swig",
+            interventions: Mapping[Any, Any],
+            *,
+            copy_cpds: bool = True,
     ) -> "Swig":
+        """Dedoublement de noeud (node-splitting) : construit le SWIG a partir du DAG factuel et de l'intervention. SWIG-1.pdf (Richardson & Robins, 2013), section 3."""
         source_nodes = tuple(str(n) for n in bn.nodes())
         source_edges = tuple((str(u), str(v)) for u, v in bn.edges())
         normalized_interventions = {str(var): value for var, value in interventions.items()}
@@ -333,42 +372,16 @@ class Swig(DiscreteBayesianNetwork):
         )
         return swig
 
-    @classmethod
-    def from_random(
-        cls,
-        *,
-        n_nodes: int = 4,
-        edge_prob: float = 0.5,
-        n_interventions: int = 1,
-        cardinality: int = 2,
-        seed: Optional[int] = None,
-    ) -> "Swig":
-        config = SwigConfig(
-            num_nodes=n_nodes,
-            graph_density=edge_prob,
-            num_latents=0,
-            cardinality=cardinality,
-            random_seed=seed,
-        )
-        source = cls(config)
-        source.generate_random_dag()
-        rng = random.Random(seed)
-        variables = [str(v) for v in source.nodes()]
-        chosen = rng.sample(variables, min(n_interventions, len(variables)))
-        interventions = {
-            var: rng.randrange(source.cardinalities.get(var, cardinality))
-            for var in chosen
-        }
-        return source.transform_to_swig(interventions)
-
     @staticmethod
     def _fixed_label(variable: str, value: Any) -> str:
+        """Etiquette du noeud fixe do(X=v) issu du dedoublement. SWIG-1.pdf, section 3 (etape Split Nodes)."""
         return f"do({variable}={value})"
 
     @staticmethod
     def _random_label(
-        variable: str, fixed_ancestors: Tuple[str, ...], interventions: Mapping[str, Any]
+            variable: str, fixed_ancestors: Tuple[str, ...], interventions: Mapping[str, Any]
     ) -> str:
+        """Etiquette du noeud aleatoire (potential outcome) indexe par ses ancetres fixes. SWIG-1.pdf, section 3 (etape Labeling)."""
         if not fixed_ancestors:
             return variable
         suffix = ",".join(
@@ -486,6 +499,7 @@ class Swig(DiscreteBayesianNetwork):
         return list(range(cardinality))
 
     def transform_to_swig(self, interventions: Dict[str, int]) -> "Swig":
+        """Applique l'intervention do(X=v) et renvoie le SWIG correspondant (node-splitting). SWIG-1.pdf, section 3."""
         normalized: Dict[str, int] = {}
         for var, val in interventions.items():
             if var not in self.nodes():
@@ -502,21 +516,6 @@ class Swig(DiscreteBayesianNetwork):
     def random_node_for(self, source_var: Any) -> str:
         return self.spec.random_of[str(source_var)]
 
-    def fixed_node_for(self, source_var: Any) -> str:
-        return self.spec.fixed_of[str(source_var)]
-
-    def source_variable(self, swig_node: Any) -> str:
-        return self.spec.source_of[str(swig_node)]
-
-    def node_info(self, swig_node: Any) -> SwigNodeInfo:
-        return self.spec.node_info[str(swig_node)]
-
-    def is_swig_fixed_node(self, swig_node: Any) -> bool:
-        return self.spec.node_info[str(swig_node)].is_fixed
-
-    def is_swig_random_node(self, swig_node: Any) -> bool:
-        return self.spec.node_info[str(swig_node)].is_random
-
     def counterfactual_nodes(self) -> List[str]:
         return sorted(
             label for label, info in self.spec.node_info.items()
@@ -524,7 +523,7 @@ class Swig(DiscreteBayesianNetwork):
         )
 
     def query_probability(
-        self, target: str, state: Any = 1, evidence: Optional[Dict[str, int]] = None
+            self, target: str, state: Any = 1, evidence: Optional[Dict[str, int]] = None
     ) -> float:
         if target not in self.nodes():
             raise ValueError(f"La variable cible '{target}' n'est pas resoluble.")
@@ -538,11 +537,12 @@ class Swig(DiscreteBayesianNetwork):
         return float(round(result.values[target_states.index(state)], 6))
 
     def check_d_separation(
-        self,
-        target: Any, treatment: Any,
-        observed_vars: Optional[List] = None,
-        forbid_latents: bool = True,
+            self,
+            target: Any, treatment: Any,
+            observed_vars: Optional[List] = None,
+            forbid_latents: bool = True,
     ) -> bool:
+        """d-separation contrefactuelle entre treatment et target sachant observed_vars, en interdisant de conditionner sur une variable latente (observabilite). SWIG-1.pdf, section 'A new graphical view of the back-door formula'."""
         observed = list(observed_vars or [])
         if forbid_latents:
             for obs in observed:
@@ -552,14 +552,147 @@ class Swig(DiscreteBayesianNetwork):
                         f"Rupture d'observabilite : impossible de conditionner "
                         f"l'ancetre latent '{obs}'."
                     )
-        return self.counterfactual_d_separation(
+        return SwigIdentification.counterfactual_d_separation(
             self, {treatment}, {target}, set(observed)
         )
 
+    def render_graph_description(self) -> str:
+        return " ".join(
+            f"Node {n} points to {', '.join(map(str, sorted(self.successors(n))))}."
+            if self.out_degree(n) > 0
+            else f"Node {n} has no outgoing links."
+            for n in sorted(self.nodes())
+        )
+
+    def cpds_text(self) -> str:
+        cpds_by_var = {str(cpd.variable): cpd for cpd in self.get_cpds()}
+        return "\n\n".join(self._cpd_to_text(cpds_by_var[n]) for n in sorted(cpds_by_var.keys()))
+
+    @staticmethod
+    def _cpd_to_text(cpd: TabularCPD, n_round: int = 6) -> str:
+        child = str(cpd.variable)
+        child_states = Swig._cpd_states(cpd, cpd.variable, int(cpd.variable_card))
+        parent_vars = list(cpd.variables[1:])
+        parent_cards = [int(c) for c in cpd.cardinality[1:]]
+        parent_states_list = [
+            Swig._cpd_states(cpd, p, c) for p, c in zip(parent_vars, parent_cards)
+        ]
+        values = cpd.get_values()
+        if not parent_vars:
+            return "\n".join(
+                f"P({child}={state}) = {round(float(values[i, 0]), n_round)}"
+                for i, state in enumerate(child_states)
+            )
+        lines: List[str] = []
+        for col, cfg in enumerate(product(*parent_states_list)):
+            cond_str = ", ".join(f"{str(p)}={v}" for p, v in zip(parent_vars, cfg))
+            for i, state in enumerate(child_states):
+                p = round(float(values[i, col]), n_round)
+                lines.append(f"P({child}={state} | {cond_str}) = {p}")
+        return "\n".join(lines)
+
+    def to_nl(self) -> str:
+        lines = ["Single-World Intervention Graph."]
+        if self.spec.interventions:
+            intervention_text = ", ".join(
+                f"{var} set to {value!r}"
+                for var, value in sorted(self.spec.interventions.items())
+            )
+            lines.append(f"Interventions: {intervention_text}.")
+        else:
+            lines.append("Interventions: none.")
+        fixed = [info for info in self.spec.node_info.values() if info.kind == "fixed"]
+        random_nodes = [info for info in self.spec.node_info.values() if info.kind == "random"]
+        if fixed:
+            lines.append("Fixed nodes:")
+            for info in sorted(fixed, key=lambda x: x.label):
+                lines.append(
+                    f"- {info.label}: fixed value for source variable {info.source}."
+                )
+        lines.append("Random nodes:")
+        for info in sorted(random_nodes, key=lambda x: x.label):
+            if info.fixed_ancestors:
+                ancestors = ", ".join(info.fixed_ancestors)
+                lines.append(
+                    f"- {info.label}: source variable {info.source} under "
+                    f"fixed ancestors {ancestors}."
+                )
+            else:
+                lines.append(f"- {info.label}: source variable {info.source}.")
+        lines.append("Edges:")
+        for parent, child in sorted(self.edges()):
+            lines.append(f"- {parent} -> {child}")
+        return "\n".join(lines)
+
+    def copy(self) -> "Swig":
+        copied = Swig(
+            config=copy.deepcopy(self.config),
+            source_bn=self.source_bn,
+            spec=SwigSpec.from_dict(self.spec.to_dict()),
+        )
+        copied.add_nodes_from(self.nodes())
+        copied.add_edges_from(self.edges())
+        copied.trace = list(self.trace)
+        copied.cardinalities = dict(self.cardinalities)
+        copied.latents = set(self.latents)
+        for cpd in self.get_cpds():
+            copied.add_cpds(cpd.copy())
+        return copied
+
+class SwigIdentification:
+    """Boite a outils d'identification causale sur les SWIG (Single-World
+    Intervention Graphs, Richardson & Robins 2013).
+
+    "Identifier" une requete contrefactuelle, c'est repondre a deux questions :
+      1. La quantite est-elle calculable a partir de la seule distribution
+         observee (sans connaitre les mecanismes caches) ? -> reponse booleenne.
+      2. Si oui, par quelle formule ? -> estimande rendu sous forme de chaine
+         symbolique (g-formule, ajustement, factorisation, etc.).
+
+    Cette classe ne fait que de l'analyse GRAPHIQUE et SYMBOLIQUE : elle raisonne
+    sur la structure du graphe, jamais sur des valeurs numeriques de CPD (le
+    calcul numerique des contrefactuels releve de SwigCounterfactualEngine).
+
+    Conventions :
+      - Toutes les methodes sont statiques et pures : elles prennent en entree
+        un (ou plusieurs) graphe networkx.DiGraph representant un SWIG et ne
+        modifient rien.
+      - Dans un SWIG, chaque noeud est soit "aleatoire" (variable de reponse,
+        ex. Y, ou Y(x) contrefactuel), soit "fixe" (sommet d'intervention issu
+        de la scission d'un noeud traite, ex. X=x). _partition_nodes separe ces
+        deux familles ; un noeud fixe bloque tout chemin de d-separation.
+      - Les methodes booleennes (counterfactual_d_separation,
+        swig_sequential_plan_evaluation_criterion) testent l'identifiabilite ;
+        les methodes "swig_*_computation" / "_factorization" / "_criterion" /
+        "_reduction" / "_ett_*" renvoient l'estimande symbolique correspondant.
+
+    Catalogue des methodes :
+      - counterfactual_d_separation            : d-separation restreinte au
+                                                 sous-graphe des noeuds aleatoires.
+      - swig_joint_factorization               : factorisation de Markov de la
+                                                 jointe contrefactuelle P(V(a)).
+      - swig_extended_g_computation            : g-formule etendue identifiant la
+                                                 distribution des contrefactuels.
+      - swig_marginal_g_computation            : g-formule marginalisee sur les
+                                                 variables ni traitees ni cibles.
+      - swig_counterfactual_adjustment_criterion : critere d'ajustement (backdoor
+                                                 contrefactuel) + estimande.
+      - swig_recursive_counterfactual_reduction : reduction recursive d'un
+                                                 contrefactuel dans le modele FFRCISTG.
+      - swig_ett_identification                : effet du traitement sur les
+                                                 traites (ETT).
+      - swig_sequential_plan_evaluation_criterion : identifiabilite d'un regime
+                                                 de traitement sequentiel.
+
+    Reference principale : SWIG-1.pdf (Richardson & Robins, 2013), Theoreme 1
+    (factorisation = Markov global) et les sections d'identification associees.
+    """
+
     @staticmethod
     def counterfactual_d_separation(
-        graph: nx.DiGraph, X: Set, Y: Set, Z: Set
+            graph: nx.DiGraph, X: Set, Y: Set, Z: Set
     ) -> bool:
+        """d-separation contrefactuelle : d-separation appliquee au sous-graphe des noeuds aleatoires du SWIG (un noeud fixe bloque tout chemin). SWIG-1.pdf, Theoreme 1 (factorisation = Markov global)."""
         X_set, Y_set, Z_set = set(X), set(Y), set(Z)
         random_vars, _ = _partition_nodes(graph)
         for label, subset in (("X", X_set), ("Y", Y_set), ("Z", Z_set)):
@@ -572,18 +705,20 @@ class Swig(DiscreteBayesianNetwork):
         purified = graph.subgraph(random_vars)
         return _is_d_separator(purified, X_set, Y_set, Z_set)
 
+    @staticmethod
     def swig_extended_g_computation(
-        self, graph_G: nx.DiGraph, graph_swig: nx.DiGraph
+            graph_G: nx.DiGraph, graph_swig: nx.DiGraph
     ) -> str:
+        """Formule de g-computation etendue (Robins et al., 2004) identifiant la distribution des contrefactuels en l'absence de variables cachees. SWIG-1.pdf, abstract + Theoreme 1."""
         hidden = {
             n for n in graph_G.nodes()
             if graph_G.nodes[n].get("hidden", False)
-            or graph_G.nodes[n].get("observed", True) is False
-            or graph_G.nodes[n].get("latent", False)
+               or graph_G.nodes[n].get("observed", True) is False
+               or graph_G.nodes[n].get("latent", False)
         }
         if hidden:
             raise ValueError(f"G-computation : variables cachees detectees : {hidden}")
-        formula = " * ".join(f.expr for f in self._build_g_factors(graph_G, graph_swig))
+        formula = " * ".join(f.expr for f in SwigIdentification._build_g_factors(graph_G, graph_swig))
         for tok in ("fixed", "concrete_fixed", "frozenset", "tuple"):
             if tok in formula:
                 raise ValueError(
@@ -591,13 +726,9 @@ class Swig(DiscreteBayesianNetwork):
                 )
         return formula
 
-    def _build_g_factors(self, graph_G: nx.DiGraph, graph_swig: nx.DiGraph):
-        class _Factor:
-            __slots__ = ("expr", "vars")
-            def __init__(self, expr, vars_):
-                self.expr = expr
-                self.vars = vars_
-
+    @staticmethod
+    def _build_g_factors(graph_G: nx.DiGraph, graph_swig: nx.DiGraph):
+        """Construit les facteurs P(V | parents) de la g-formule a partir du SWIG (helper de swig_extended_g_computation et swig_marginal_g_computation). SWIG-1.pdf, Theoreme 1."""
         random_vars, fixed_nodes = _partition_nodes(graph_swig)
         factors: List[_Factor] = []
         intervention_registry: Dict[str, str] = {}
@@ -638,9 +769,11 @@ class Swig(DiscreteBayesianNetwork):
             factors.append(_Factor(expr=f"P({v_sym} | {cond_str})", vars_=dep))
         return factors
 
+    @staticmethod
     def swig_counterfactual_adjustment_criterion(
-        self, graph_swig: nx.DiGraph, X: Any, Y_counterfactual: Any, L: Set
+            graph_swig: nx.DiGraph, X: Any, Y_counterfactual: Any, L: Set
     ) -> Tuple[bool, str]:
+        """Critere d'ajustement contrefactuel : si X est d-separe de Y(x) sachant L dans le SWIG, alors P(Y(x)=y) = somme_l P(Y=y | L=l, X=x) P(L=l). SWIG-1.pdf, p.9, formule (8)."""
         L_set = set(L)
         random_vars, fixed_nodes = _partition_nodes(graph_swig)
         if X not in random_vars:
@@ -672,7 +805,7 @@ class Swig(DiscreteBayesianNetwork):
         A_set = {
             v for v in random_vars if str(_get_base_variable(str(v))) in active_interventions
         }
-        is_identifiable = self.counterfactual_d_separation(
+        is_identifiable = SwigIdentification.counterfactual_d_separation(
             graph_swig, A_set, {Y_counterfactual}, L_set
         )
         if not is_identifiable:
@@ -692,10 +825,12 @@ class Swig(DiscreteBayesianNetwork):
             formula = f"P({Y_base} | {y_cond_str})"
         return (True, formula)
 
+    @staticmethod
     def swig_recursive_counterfactual_reduction(
-        self, graph_G: nx.DiGraph, V: Any, R: Set, r_tilde: Dict[Any, Any],
-        _path: Optional[Set] = None,
+            graph_G: nx.DiGraph, V: Any, R: Set, r_tilde: Dict[Any, Any],
+            _path: Optional[Set] = None,
     ) -> str:
+        """Substitution recursive d'un contrefactuel du modele FFRCISTG : un contrefactuel sous intervention est defini en substituant recursivement la valeur contrefactuelle de ses parents non intervenus. SWIG-1.pdf, section 6 (FFRCISTG counterfactual model)."""
         if _path is None:
             _path = set()
         if V in _path:
@@ -731,22 +866,18 @@ class Swig(DiscreteBayesianNetwork):
             p_val = str(r_tilde.get(p, f"a_{p}"))
             index_elements.append(f"{p}={p_val}")
         for p in sorted(random_parents, key=lambda x: str(x)):
-            expr = self.swig_recursive_counterfactual_reduction(
+            expr = SwigIdentification.swig_recursive_counterfactual_reduction(
                 graph_G, p, R_set, r_tilde, current_path
             )
             index_elements.append(expr)
         index_elements.sort(key=lambda x: x.split("(")[0].split("=")[0])
         return f"{V_str}({', '.join(index_elements)})"
 
+    @staticmethod
     def swig_marginal_g_computation(
-        self, graph_G: nx.DiGraph, graph_swig: nx.DiGraph, Y: Set, A: Set
+            graph_G: nx.DiGraph, graph_swig: nx.DiGraph, Y: Set, A: Set
     ) -> str:
-        class _Factor:
-            __slots__ = ("expr", "vars")
-            def __init__(self, expr, vars_):
-                self.expr = expr
-                self.vars = vars_
-
+        """Distribution marginale P(V(a)) obtenue en marginalisant la g-formule. SWIG-1.pdf, Theoreme 1 (la distribution marginale factorise selon G(a))."""
         V_strs = {str(v) for v in graph_G.nodes()}
         Y_strs = {str(y) for y in Y}
         A_strs = {str(a) for a in A}
@@ -759,7 +890,7 @@ class Swig(DiscreteBayesianNetwork):
                 f"Marginalisation : A et Y doivent etre strictement disjoints : {A_strs & Y_strs}"
             )
         W_strs = V_strs - (A_strs | Y_strs)
-        factors = self._build_g_factors(graph_G, graph_swig)
+        factors = SwigIdentification._build_g_factors(graph_G, graph_swig)
         for w in sorted(W_strs):
             dep_factors = [f for f in factors if w in f.vars]
             indep_factors = [f for f in factors if w not in f.vars]
@@ -772,14 +903,15 @@ class Swig(DiscreteBayesianNetwork):
         factors.sort(key=lambda x: x.expr)
         return " * ".join(f.expr for f in factors)
 
+    @staticmethod
     def swig_ett_identification(
-        self,
-        graph_G: nx.DiGraph,
-        graph_swig_x1: nx.DiGraph,
-        graph_swig_x0: nx.DiGraph,
-        X: Any, Y: Any,
-        x_1: str, x_0: str,
+            graph_G: nx.DiGraph,
+            graph_swig_x1: nx.DiGraph,
+            graph_swig_x0: nx.DiGraph,
+            X: Any, Y: Any,
+            x_1: str, x_0: str,
     ) -> str:
+        """Identification de l'effet du traitement sur les traites (ETT) : E[Y(x1)] - E[Y(x0) | X=x1]. SWIG-1.pdf, p.5 (derivation de l'ETT)."""
         if graph_swig_x1 is graph_swig_x0:
             raise ValueError("ETT : les deux SWIGs doivent provenir d'instances distinctes.")
 
@@ -799,7 +931,7 @@ class Swig(DiscreteBayesianNetwork):
         if not all([X1, Y1, X0, Y0]):
             raise ValueError("ETT : variables d'analyse critiques manquantes dans les mondes SWIG.")
         first = f"E[{Y} | X={x_1}]"
-        is_unconf = self.counterfactual_d_separation(graph_swig_x0, {X0}, {Y0}, set())
+        is_unconf = SwigIdentification.counterfactual_d_separation(graph_swig_x0, {X0}, {Y0}, set())
         if is_unconf:
             second = f"E[{Y} | X={x_0}]"
         else:
@@ -816,7 +948,7 @@ class Swig(DiscreteBayesianNetwork):
                             f"ETT : parent '{p}' corrompu par un indice contrefactuel en aval."
                         )
                 L0.add(resolved)
-            if L0 and self.counterfactual_d_separation(graph_swig_x0, {X0}, {Y0}, L0):
+            if L0 and SwigIdentification.counterfactual_d_separation(graph_swig_x0, {X0}, {Y0}, L0):
                 sorted_L = sorted(str(_get_base_variable(str(l))) for l in L0)
                 second = (
                     f"Sum_{{{', '.join(sorted_L)}}} "
@@ -827,13 +959,14 @@ class Swig(DiscreteBayesianNetwork):
                 raise ValueError("ETT : structure non-identifiable, backdoor non bloquee.")
         return f"{first} - {second}"
 
+    @staticmethod
     def swig_sequential_plan_evaluation_criterion(
-        self,
-        graph_swig: nx.DiGraph,
-        ordered_treatments: List,
-        ordered_covariates: List[Set],
-        Y_counterfactual: Any,
+            graph_swig: nx.DiGraph,
+            ordered_treatments: List,
+            ordered_covariates: List[Set],
+            Y_counterfactual: Any,
     ) -> bool:
+        """Evalue l'identifiabilite d'un plan/regime de traitement sequentiel sur un seul SWIG. SWIG-1.pdf, p.4 (regimes sequentiels ; cf. Pearl & Robins, 1995)."""
         k = len(ordered_treatments)
         if len(ordered_covariates) != k:
             raise ValueError(
@@ -881,11 +1014,13 @@ class Swig(DiscreteBayesianNetwork):
                             to_purge.add(node)
                             break
             subgraph = graph_swig.subgraph(all_nodes - to_purge)
-            if not self.counterfactual_d_separation(subgraph, {X_m}, {Y_counterfactual}, H_m):
+            if not SwigIdentification.counterfactual_d_separation(subgraph, {X_m}, {Y_counterfactual}, H_m):
                 return False
         return True
 
-    def swig_joint_factorization(self, graph: nx.DiGraph) -> str:
+    @staticmethod
+    def swig_joint_factorization(graph: nx.DiGraph) -> str:
+        """Factorisation de la distribution jointe des contrefactuels P(V(a)) selon le SWIG. SWIG-1.pdf, Theoreme 1 (factorization)."""
         random_vars, _ = _partition_nodes(graph)
         terms: List[str] = []
         for v in sorted(random_vars, key=lambda x: str(x)):
@@ -898,135 +1033,48 @@ class Swig(DiscreteBayesianNetwork):
                 terms.append(f"P({v_sym})")
         return " * ".join(terms)
 
-    def render_graph_description(self) -> str:
-        return " ".join(
-            f"Node {n} points to {', '.join(map(str, sorted(self.successors(n))))}."
-            if self.out_degree(n) > 0
-            else f"Node {n} has no outgoing links."
-            for n in sorted(self.nodes())
-        )
-
-    def cpds_text(self) -> str:
-        cpds_by_var = {str(cpd.variable): cpd for cpd in self.get_cpds()}
-        return "\n\n".join(self._cpd_to_text(cpds_by_var[n]) for n in sorted(cpds_by_var.keys()))
-
-    @staticmethod
-    def _cpd_to_text(cpd: TabularCPD, n_round: int = 6) -> str:
-        child = str(cpd.variable)
-        child_states = Swig._cpd_states(cpd, cpd.variable, int(cpd.variable_card))
-        parent_vars = list(cpd.variables[1:])
-        parent_cards = [int(c) for c in cpd.cardinality[1:]]
-        parent_states_list = [
-            Swig._cpd_states(cpd, p, c) for p, c in zip(parent_vars, parent_cards)
-        ]
-        values = cpd.get_values()
-        if not parent_vars:
-            return "\n".join(
-                f"P({child}={state}) = {round(float(values[i, 0]), n_round)}"
-                for i, state in enumerate(child_states)
-            )
-        lines: List[str] = []
-        for col, cfg in enumerate(product(*parent_states_list)):
-            cond_str = ", ".join(f"{str(p)}={v}" for p, v in zip(parent_vars, cfg))
-            for i, state in enumerate(child_states):
-                p = round(float(values[i, col]), n_round)
-                lines.append(f"P({child}={state} | {cond_str}) = {p}")
-        return "\n".join(lines)
-
-    def validate_swig_metadata(self) -> None:
-        graph_nodes = set(map(str, self.nodes()))
-        metadata_nodes = set(self.spec.node_info)
-        if graph_nodes != metadata_nodes:
-            raise ValueError(
-                "SWIG metadata/node mismatch: "
-                f"graph_only={sorted(graph_nodes - metadata_nodes)}, "
-                f"metadata_only={sorted(metadata_nodes - graph_nodes)}"
-            )
-        for source_var in self.spec.source_nodes:
-            if source_var not in self.spec.random_of:
-                raise ValueError(f"Missing random node for source variable {source_var}")
-        for source_var in self.spec.interventions:
-            if source_var not in self.spec.fixed_of:
-                raise ValueError(f"Missing fixed node for intervention on {source_var}")
-
-    def to_nl(self) -> str:
-        lines = ["Single-World Intervention Graph."]
-        if self.spec.interventions:
-            intervention_text = ", ".join(
-                f"{var} set to {value!r}"
-                for var, value in sorted(self.spec.interventions.items())
-            )
-            lines.append(f"Interventions: {intervention_text}.")
-        else:
-            lines.append("Interventions: none.")
-        fixed = [info for info in self.spec.node_info.values() if info.kind == "fixed"]
-        random_nodes = [info for info in self.spec.node_info.values() if info.kind == "random"]
-        if fixed:
-            lines.append("Fixed nodes:")
-            for info in sorted(fixed, key=lambda x: x.label):
-                lines.append(
-                    f"- {info.label}: fixed value for source variable {info.source}."
-                )
-        lines.append("Random nodes:")
-        for info in sorted(random_nodes, key=lambda x: x.label):
-            if info.fixed_ancestors:
-                ancestors = ", ".join(info.fixed_ancestors)
-                lines.append(
-                    f"- {info.label}: source variable {info.source} under "
-                    f"fixed ancestors {ancestors}."
-                )
-            else:
-                lines.append(f"- {info.label}: source variable {info.source}.")
-        lines.append("Edges:")
-        for parent, child in sorted(self.edges()):
-            lines.append(f"- {parent} -> {child}")
-        return "\n".join(lines)
-
-    def to_serializable(self) -> Dict[str, Any]:
-        return {
-            "spec": self.spec.to_dict(),
-            "nodes": list(self.nodes()),
-            "edges": list(self.edges()),
-            "trace": list(self.trace),
-        }
-
-    @classmethod
-    def from_serializable(
-        cls, data: Mapping[str, Any], *, source_bn: Optional["Swig"] = None
-    ) -> "Swig":
-        spec = SwigSpec.from_dict(data["spec"])
-        swig = cls(source_bn=source_bn, spec=spec)
-        swig.add_nodes_from(data.get("nodes", ()))
-        swig.add_edges_from(data.get("edges", ()))
-        swig.trace = list(data.get("trace", ()))
-        if swig.source_bn is not None:
-            swig._build_swig_cpds()
-        return swig
-
-    def copy(self) -> "Swig":
-        copied = Swig(
-            config=copy.deepcopy(self.config),
-            source_bn=self.source_bn,
-            spec=SwigSpec.from_dict(self.spec.to_dict()),
-        )
-        copied.add_nodes_from(self.nodes())
-        copied.add_edges_from(self.edges())
-        copied.trace = list(self.trace)
-        copied.cardinalities = dict(self.cardinalities)
-        copied.latents = set(self.latents)
-        for cpd in self.get_cpds():
-            copied.add_cpds(cpd.copy())
-        return copied
 
 class SwigCounterfactualEngine:
-    """
-    Moteur d'inference contrefactuelle exacte par enumeration des fonctions
-    de reponse (SCM canonique Markovien).
+    """Moteur de calcul NUMERIQUE exact de requetes contrefactuelles, par
+    enumeration des fonctions de reponse (Balke & Pearl 1994).
 
-    Algorithme en 3 etapes :
-    1. Abduction  : conditionne les tables de reponse sur l'evidence factuelle
-    2. Action     : applique l'intervention (do-operator) dans le SWIG
-    3. Prediction : lit la variable cible dans le monde contrefactuel
+    La distinction avec SwigIdentification est essentielle :
+      - SwigIdentification raisonne sur la STRUCTURE du graphe et rend des
+        formules symboliques / des verdicts d'identifiabilite ;
+      - SwigCounterfactualEngine, lui, CALCULE une distribution de probabilite
+        chiffree P(Y(x) = y | evidence) a partir des CPDs concretes du reseau
+        source.
+
+    Principe (SCM canonique markovien). Chaque variable du reseau source est
+    re-exprimee par une "fonction de reponse" : une table deterministe qui, pour
+    chaque configuration de parents, fixe la valeur de la variable. Le hasard est
+    entierement deporte dans le tirage de ces tables, dont la loi est induite par
+    les CPDs source. Enumerer toutes les tables (ponderees par leur probabilite)
+    permet de simuler simultanement le monde factuel et le monde contrefactuel
+    avec le MEME bruit, ce qu'exige un contrefactuel.
+
+    Algorithme d'inference en 3 etapes (Pearl) :
+      1. Abduction  : ne retenir que les tables de reponse compatibles avec
+                      l'evidence factuelle observee (et ponderer par P(evidence)).
+      2. Action     : appliquer l'intervention do(X=x) du SWIG dans ces memes tables.
+      3. Prediction : lire la variable cible dans le monde ainsi intervenu et
+                      agreger les poids pour reconstituer sa distribution.
+
+    Prerequis : le reseau doit etre markovien (sans confondeur latent) et exposer
+    son `source_bn` ; ces deux conditions sont verifiees a la construction.
+
+    Garde-fou : l'enumeration est exacte donc exponentielle. `max_response_functions`
+    plafonne la taille de l'espace de reponses ; au-dela, query(...) leve une erreur
+    plutot que de lancer un calcul ingerable (voir response_space_size()).
+
+    Methodes principales :
+      - query(target, evidence)             : distribution contrefactuelle chiffree.
+      - explain_query(target, evidence)     : trace pedagogique des 3 etapes.
+      - probability_of_factual_evidence(...) : P(evidence) sous le SCM canonique.
+      - response_space_size()               : taille de l'espace a enumerer.
+
+    Reference : "Probabilistic evaluation of counterfactual queries", Balke &
+    Pearl (1994) (cf. docRecherche/).
     """
 
     def __init__(self, swig: Swig, *, max_response_functions: int = 200_000):
@@ -1059,9 +1107,9 @@ class SwigCounterfactualEngine:
         return size
 
     def explain_query(
-        self,
-        target: Any,
-        factual_evidence: Optional[Mapping[Any, Any]] = None,
+            self,
+            target: Any,
+            factual_evidence: Optional[Mapping[Any, Any]] = None,
     ) -> str:
         target_source = self._target_source(target)
         target_node = self.swig.random_node_for(target_source)
@@ -1078,12 +1126,13 @@ class SwigCounterfactualEngine:
         return "\n".join(self.trace)
 
     def query(
-        self,
-        target: Any,
-        factual_evidence: Optional[Mapping[Any, Any]] = None,
-        *,
-        n_round: Optional[int] = None,
+            self,
+            target: Any,
+            factual_evidence: Optional[Mapping[Any, Any]] = None,
+            *,
+            n_round: Optional[int] = None,
     ) -> Dict[Any, float]:
+        """Calcule P(cible_x | evidence) par abduction-action-prediction, via enumeration des fonctions de reponse (SCM markovien canonique). Balke & Pearl (1994), 'Probabilistic evaluation of counterfactual queries' (cf. docRecherche/)."""
         target_source = self._target_source(target)
         evidence = self._normalize_factual_evidence(factual_evidence or {})
         response_space = self.response_space_size()
@@ -1229,10 +1278,10 @@ class SwigCounterfactualEngine:
                 yield table, weight
 
     def _evaluate_world(
-        self,
-        response_tables: Mapping[str, Mapping[Tuple[Any, ...], Any]],
-        *,
-        interventions: Mapping[str, Any],
+            self,
+            response_tables: Mapping[str, Mapping[Tuple[Any, ...], Any]],
+            *,
+            interventions: Mapping[str, Any],
     ) -> Dict[str, Any]:
         values: Dict[str, Any] = {}
         normalized_interventions = {str(source): value for source, value in interventions.items()}
@@ -1247,12 +1296,12 @@ class SwigCounterfactualEngine:
 
     @staticmethod
     def _world_matches(
-        world: Mapping[str, Any], evidence: Mapping[str, Any]
+            world: Mapping[str, Any], evidence: Mapping[str, Any]
     ) -> bool:
         return all(world[source] == value for source, value in evidence.items())
 
     def _normalize_factual_evidence(
-        self, evidence: Mapping[Any, Any]
+            self, evidence: Mapping[Any, Any]
     ) -> Dict[str, Any]:
         normalized: Dict[str, Any] = {}
         for raw_key, value in evidence.items():
@@ -1290,10 +1339,10 @@ class SwigCounterfactualEngine:
 
     @staticmethod
     def _cpd_probability(
-        cpd: TabularCPD,
-        state: Any,
-        parent_keys: Tuple[Any, ...],
-        parent_config: Tuple[Any, ...],
+            cpd: TabularCPD,
+            state: Any,
+            parent_keys: Tuple[Any, ...],
+            parent_config: Tuple[Any, ...],
     ) -> float:
         kwargs = {str(cpd.variable): state}
         kwargs.update(
@@ -1308,33 +1357,21 @@ class SwigCounterfactualEngine:
 
     @staticmethod
     def _cpd_probability_from_table(
-        cpd: TabularCPD,
-        state: Any,
-        parent_keys: Tuple[Any, ...],
-        parent_config: Tuple[Any, ...],
+            cpd: TabularCPD,
+            state: Any,
+            parent_keys: Tuple[Any, ...],
+            parent_config: Tuple[Any, ...],
     ) -> float:
         child_states = Swig._cpd_states(cpd, cpd.variable, int(cpd.variable_card))
         child_index = child_states.index(state)
         column_index = 0
         for parent, parent_value, cardinality in zip(
-            parent_keys, parent_config, cpd.cardinality[1:]
+                parent_keys, parent_config, cpd.cardinality[1:]
         ):
             parent_states = Swig._cpd_states(cpd, parent, int(cardinality))
             column_index = column_index * len(parent_states)
             column_index += parent_states.index(parent_value)
         return float(cpd.get_values()[child_index, column_index])
-
-def compute_cbn_225(self, target, intervention, factual_evidence=None, *, n_round=None):
-    """
-    Calcule la distribution contrefactuelle d'une variable cible
-    dans le cadre CBN2.25.
-
-    target : variable à prédire dans le monde contrefactuel
-    intervention : action imposée, par exemple {"A": "a"}
-    factual_evidence : observations du monde réel, par exemple {"B": "b", "C": "c"}
-    n_round : arrondi optionnel des probabilités
-    """
-    pass
 
 
 __all__ = [
@@ -1342,5 +1379,6 @@ __all__ = [
     "SwigConfig",
     "SwigSpec",
     "SwigNodeInfo",
+    "SwigIdentification",
     "SwigCounterfactualEngine",
 ]
