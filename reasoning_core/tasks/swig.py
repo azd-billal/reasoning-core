@@ -1373,53 +1373,53 @@ class SwigCounterfactualEngine:
             column_index += parent_states.index(parent_value)
         return float(cpd.get_values()[child_index, column_index])
 
-def compute_cbn_225(self, target, factual_evidence=None, *, n_round=None):
-    evidence = self._normalize_factual_evidence(factual_evidence or {})
-    target_source = self._target_source(target)
-
-    weights = {state: 0.0 for state in self.mechanisms[target_source].states}
-    evidence_weight = 0.0
-
-    for response_tables, response_weight in self._iter_response_tables():
-        # 1. Abduction: evaluate the factual world
-        factual_world = self._evaluate_world(
-            response_tables,
-            interventions={}
-        )
-
-        # Keep only worlds compatible with factual evidence
-        if not self._world_matches(factual_world, evidence):
-            continue
-
-        evidence_weight += response_weight
-
-        # 2. Action: apply the SWIG intervention
-        counterfactual_world = self._evaluate_world(
-            response_tables,
-            interventions=self.swig.spec.interventions
-        )
-
-        # 3. Prediction: accumulate the target value
-        target_value = counterfactual_world[target_source]
-        weights[target_value] += response_weight
-
-    if evidence_weight == 0:
-        raise ValueError(
-            "The factual evidence has probability zero under the model."
-        )
-
-    distribution = {
-        state: weight / evidence_weight
-        for state, weight in weights.items()
-    }
-
-    if n_round is not None:
+    def compute_cbn_225(self, target, factual_evidence=None, *, n_round=None):
+        evidence = self._normalize_factual_evidence(factual_evidence or {})
+        target_source = self._target_source(target)
+    
+        weights = {state: 0.0 for state in self.mechanisms[target_source].states}
+        evidence_weight = 0.0
+    
+        for response_tables, response_weight in self._iter_response_tables():
+            # 1. Abduction: evaluate the factual world
+            factual_world = self._evaluate_world(
+                response_tables,
+                interventions={}
+            )
+    
+            # Keep only worlds compatible with factual evidence
+            if not self._world_matches(factual_world, evidence):
+                continue
+    
+            evidence_weight += response_weight
+    
+            # 2. Action: apply the SWIG intervention
+            counterfactual_world = self._evaluate_world(
+                response_tables,
+                interventions=self.swig.spec.interventions
+            )
+    
+            # 3. Prediction: accumulate the target value
+            target_value = counterfactual_world[target_source]
+            weights[target_value] += response_weight
+    
+        if evidence_weight == 0:
+            raise ValueError(
+                "The factual evidence has probability zero under the model."
+            )
+    
         distribution = {
-            state: round(probability, n_round)
-            for state, probability in distribution.items()
+            state: weight / evidence_weight
+            for state, weight in weights.items()
         }
-
-    return distribution
+    
+        if n_round is not None:
+            distribution = {
+                state: round(probability, n_round)
+                for state, probability in distribution.items()
+            }
+    
+        return distribution
 
 
 __all__ = [
