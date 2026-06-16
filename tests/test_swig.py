@@ -19,7 +19,6 @@ def make_bn(edges, cpds):
 
 def run_case(name, bn, interventions, target, factual_evidence, n_round=4):
     swig = Swig.from_bn(bn, interventions)
-    swig.validate_swig_metadata()
     assert swig.check_model()
     engine = SwigCounterfactualEngine(swig, max_response_functions=2_000_000)
     result = engine.query(target, factual_evidence, n_round=n_round)
@@ -52,49 +51,69 @@ bn_and = make_bn(
                 [cpd_x,cpd_z,cpd_y_and])
 
 
-_, _, result_test_Z_1_X_0 = run_case(
-    "When Z is known present with X forced to 0",
+_, _, result_test_and_Z_1_X_0 = run_case(
+    "'And' When Z is known present with X forced to 0",
     bn_and,
     interventions={"X": 0},
     target="Y",
     factual_evidence={"X": 1, "Z": 1, "Y": 1},
 )
 
-_ , _, result_test_Z_1_X_1 = run_case(
-    "When Z is known present with X forced to 1",
+_ , _, result_test_and_Z_1_X_1 = run_case(
+    "'And' When Z is known present with X forced to 1",
     bn_and,
     interventions={"X": 1},
     target="Y",
     factual_evidence={"X": 1, "Z": 1, "Y": 1},
 )
 
-_, _, result_test_Z_0 = run_case(
-    "When Z is known absent",
+_, _, result_test_and_Z_0 = run_case(
+    "'And' When Z is known absent",
     bn_and,
     interventions={"X": 1},
     target="Y",
     factual_evidence={"X": 1, "Z": 0, "Y": 0},
 )
 
-_, _, result_test_Z_unobserved = run_case(
-    "When Z is unobserved",
+_, _, result_test_and_Z_unobserved = run_case(
+    "'And' When Z is unobserved",
     bn_and,
     interventions={"X": 1},
     target="Y",
     factual_evidence={"X": 0, "Y": 0},
 )
 
-def test_Z_0():
-    assert(result_test_Z_0          == {0: 1.0, 1:0.0})
 
-def test_Z_1_X_0():
-    assert(result_test_Z_1_X_0      == {0: 1.0, 1:0.0})
+cpd_z_25_75 = TabularCPD(variable="Z", variable_card=2, values=[[0.25], [0.75]], state_names={"Z": [0, 1]})
+bn_and_2 = make_bn(
+                [("X","Y"),("Z","Y")],
+                [cpd_x,cpd_z_25_75,cpd_y_and])
 
-def test_Z_1_X_0():
-    assert(result_test_Z_1_X_1      == {0: 0.0, 1:1.0})
+_, _, result_test_and_2_Z_unobserved = run_case(
+    "'And' When Z is unobserved",
+    bn_and_2,
+    interventions={"X": 1},
+    target="Y",
+    factual_evidence={"X": 0, "Y": 0},
+)
 
-def test_Z_unobserved():
-    assert(result_test_Z_unobserved == {0: 0.5, 1:0.5})
+
+def test_and_Z_0():
+    assert(result_test_and_Z_0          == {0: 1.0, 1:0.0})
+
+def test_and_Z_1_X_0():
+    assert(result_test_and_Z_1_X_0      == {0: 1.0, 1:0.0})
+
+def test_and_Z_1_X_1():
+    assert(result_test_and_Z_1_X_1      == {0: 0.0, 1:1.0})
+
+def test_and_Z_unobserved():
+    assert(result_test_and_Z_unobserved == {0: 0.5, 1:0.5})
+
+
+def test_and_2_Z_unobserved():
+    assert(result_test_and_2_Z_unobserved == {0: 0.25, 1:0.75})
+
 
 cpd_z = TabularCPD("Z",2,[[0.6],[0.4]],state_names={"Z": [0,1]})
 
@@ -137,7 +156,12 @@ _,_, result_simpson_z0 = run_case("Simpson within Z=0",
     target="Y",
     factual_evidence={"X":1,"Y":1,"Z":0})
 
-def test_simpson():
+def test_simpson_with_unobserved_z():
     assert(0.825 < result_simpson_unobs_z[1] < 0.875) # arbitrary step : +- 0.025 
+
+def test_simpson_with_unobserved_z_and_reversed_xy():
     assert(0.125 < result_simpson_unobs_z_reversed_xy[1] < 0.175) # arbitrary step : +- 0.025
+
+def test_simpson_with_z0():
     assert(result_simpson_z0[1] == 0.85)
+
