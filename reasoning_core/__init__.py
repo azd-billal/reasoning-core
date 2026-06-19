@@ -50,7 +50,7 @@ def _discover_tasks():
     for filename in os.listdir(tasks_path):
         if filename.endswith('.py') and not filename.startswith('_'):
             module_name = filename[:-3]
-            with open(os.path.join(tasks_path, filename), 'r') as f:
+            with open(os.path.join(tasks_path, filename), 'r', encoding='utf-8') as f:
                 tree = ast.parse(f.read(), filename=filename)
 
 
