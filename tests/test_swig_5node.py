@@ -74,18 +74,44 @@ cpd_z = TabularCPD(
     state_names={'Z': [0,1],'X': [0,1],'Y': [0,1]},
 )
 
-bn_scenario_a = make_bn(
+bn_scenario = make_bn(
     [("V", "X"), ("V", "Y"), ("X", "W"), ("X", "Z"), ("W", "Y"), ("Y", "Z")],
     [cpd_v, cpd_w, cpd_x, cpd_y, cpd_z],
 )
 
-_, _, result_a1 = run_case(
-    "A1: Mediation with confounder, V unobserved",
-    bn_scenario_a,
-    interventions={"X": 1},
-    target="Z",
-    factual_evidence={"W": 0, "X": 0, "Y": 0, "Z":0},
+@pytest.mark.parametrize(
+    "name, bn, interventions, evidence, expected",
+    [
+        (
+            "A1: do(X=1)",
+            bn_scenario,
+            {"X": 1},
+            {"V": 0, "W": 0, "X": 0, "Y": 0, "Z": 0},
+            {0: 0.364, 1: 0.636},
+        ),
+        (
+            "A2: do(W=1)",
+            bn_scenario,
+            {"W": 1},
+            {"V": 0, "W": 0, "X": 1, "Y": 1, "Z": 1},
+            {0: 0.38, 1: 0.62},
+        ),
+        (
+            "A3: do(W=1)",
+            bn_scenario,
+            {"W": 1},
+            {"V": 1, "W": 0, "X": 0, "Y": 1, "Z": 0},
+            {0: 0.82, 1: 0.18},
+        ),
+    ],
 )
 
-def test_a1_z_unobserved():
-    assert result_a1 == {0: 0.3822, 1: 0.6178}
+def test_counterfactuals(name, bn, interventions, evidence, expected):
+    _, _, result = run_case(
+        name,
+        bn,
+        interventions=interventions,
+        target="Z",
+        factual_evidence=evidence,
+    )
+    assert result == pytest.approx(expected, rel=1e-6)
