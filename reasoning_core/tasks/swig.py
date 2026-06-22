@@ -737,7 +737,65 @@ class SwigCounterfactualEngine:
             source = self._target_source(key)
             normalized[source] = value
         return normalized
+    def compute_cbn_225(self, target, factual_evidence=None, *, n_round=None):
+    """Compute the counterfactual CBN2.25 distribution.
 
+    This method is adapted to the existing engine architecture:
+    the core computation is delegated to `_distribution_and_mass` (already
+    used by `get_cot`), ensuring that the numerical result and the
+    chain-of-thought share the exact same inference logic.
+
+    Quantity computed:
+        P(Y_x | E=e)
+
+    where:
+      - E=e is the observed factual evidence;
+      - x is the intervention already encoded in the SWIG;
+      - Y_x is the counterfactual target variable.
+
+    The method follows the three classic phases of counterfactual reasoning:
+      1. Abduction: retain only the worlds compatible with the factual evidence;
+      2. Action: apply the intervention defined in the SWIG;
+      3. Prediction: read the distribution of the counterfactual target.
+
+    It returns a complete probability distribution over all possible states
+    of the target (including states with probability 0).
+
+    Args:
+        target: The target variable (counterfactual).
+        factual_evidence: Optional dictionary of observed factual evidence.
+        n_round: If provided, round all probabilities to this number of
+                 decimal places.
+
+    Returns:
+        dict: Complete distribution {state: probability} for the target
+              under the intervention, given the evidence.
+    """
+    target_source = self._target_source(target)
+    evidence = self._normalize_factual_evidence(factual_evidence or {})
+    distribution, evidence_mass = self._distribution_and_mass(
+        target_source,
+        evidence
+    )
+    completed_distribution = {
+        state: distribution.get(state, 0.0)
+        for state in self.mechanisms[target_source].states
+    }
+    if n_round is not None:
+        completed_distribution = {
+            state: round(probability, n_round)
+            for state, probability in completed_distribution.items()
+        }
+    target_label = self.spec.random_of.get(target_source, target_source)
+    ev_txt = ", ".join(
+        f"{var}={value}" for var, value in sorted(evidence.items())
+    ) or "none"
+    self.trace.append(
+        f"compute_cbn_225({target_label} | {ev_txt}) : "
+        f"P(evidence)={evidence_mass:.6f}, "
+        f"distribution={completed_distribution}."
+    )
+    return completed_distribution
 
 __all__ = [
     "Swig",
