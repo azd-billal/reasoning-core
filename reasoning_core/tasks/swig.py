@@ -101,6 +101,7 @@ class Swig(DiscreteBayesianNetwork):
         self.observations: Optional[Dict[str, Any]] = None
         self.situation_initiale: Optional[Dict[str, Any]] = None
         self.swig_description: Optional[str] = None
+        self.engine: Optional["SwigCounterfactualEngine"] = None
 
     def generate_random_swig(
             self,
@@ -308,6 +309,11 @@ class Swig(DiscreteBayesianNetwork):
         self.add_cpds(*cpds)
         if not self.check_model():
             raise RuntimeError("CPDs du SWIG mal formees.")
+            self.target = None
+            self.observations = None
+            self.situation_initiale = None
+            self.swig_description = None
+            self.engine = None
 
     def generate_225(
             self,
@@ -404,6 +410,7 @@ class Swig(DiscreteBayesianNetwork):
         self.observations = obs
         self.situation_initiale = dict(self.spec.interventions)
         self.swig_description = self.to_nl()
+        self.engine = SwigCounterfactualEngine(self)
         return self
 
     def copy(self) -> "Swig":
@@ -667,89 +674,65 @@ class SwigCounterfactualEngine:
         return self.compute_cbn_225(target, factual_evidence).get(target_state, 0.0)
 
     def get_cot(
-            self,
-            target: Any,
-            factual_evidence: Optional[Mapping[Any, Any]] = None,
-            *,
-            target_state: Any = 1,
-    ) -> str:
-        """Raisonnement pas-a-pas (chain-of-thought) calque sur l'algorithme du
-        papier (3 phases abduction-action-prediction) menant a la reponse."""
-        target_source = self._target_source(target)
-        evidence = self._normalize_factual_evidence(factual_evidence or {})
-        distribution, mass = self._distribution_and_mass(target_source, evidence)
-        answer = distribution.get(target_state, 0.0)
-        target_label = self.spec.random_of.get(target_source, target_source)
-        do_txt = ", ".join(f"{v}={val}" for v, val in sorted(self.spec.interventions.items()))
-        ev_txt = ", ".join(f"{v}={val}" for v, val in sorted(evidence.items())) or "none"
-        dist_txt = ", ".join(
-            f"P({target_label}={s})={p:.6f}"
-            for s, p in sorted(distribution.items(), key=lambda kv: str(kv[0]))
+        self,
+        *,
+        target_state: Any = 1,
+        distribution: Optional[Mapping[Any, float]] = None,
+        evidence_mass: Optional[float] = None,
+        n_round: int = 6,
+) -> str:
+    """Raisonnement pas-a-pas pour la requete L2.25 stockee sur le SWIG.
+
+    Si `distribution` et `evidence_mass` sont fournis, on les reutilise.
+    Cela permet a compute_cbn_225 de produire la distribution et la trace
+    sans relancer le calcul.
+    """
+    target_source, evidence = self._stored_225_query()
+
+    if distribution is None or evidence_mass is None:
+        distribution, evidence_mass = self._distribution_and_mass(
+            target_source,
+            evidence
         )
-        return "\n".join([
-            f"Step 1 (Query). Compute P({target_label} = {target_state} | {ev_txt}): the "
-            f"probability that {target_source} would equal {target_state} under do({do_txt}), "
-            f"given the factual observation(s) [{ev_txt}].",
-            "Step 2 (Response-function representation, Balke & Pearl 1994). Each source "
-            "mechanism P(V | parents) is recast as an exogenous response variable r_V (it picks "
-            "V's value for every parent configuration), shared by the factual world and the "
-            "do()-world; the two worlds differ only via the intervention. The counterfactual is "
-            "evaluated by exact enumeration over these shared response functions -- the functional "
-            "equivalent of the twin network, without building an explicit twin graph.",
-            f"Step 3 (Abduction). Restrict to the response-function draws whose FACTUAL world "
-            f"matches the evidence [{ev_txt}]; their cumulative mass is P(evidence) = {mass:.6f}, "
-            f"which defines the posterior over response functions.",
-            f"Step 4 (Action). Force do({do_txt}) in the counterfactual world (sever the "
-            f"incoming edges of the intervened variable(s)).",
-            f"Step 5 (Prediction). Propagate the SAME response functions under do(); the "
-            f"counterfactual distribution of {target_label} is [{dist_txt}], hence "
-            f"P({target_label} = {target_state}) = {answer:.6f}.",
-        ])
+        distribution = self._complete_distribution(target_source, distribution)
 
-    def compute_cbn_225(self, target, factual_evidence=None, *, n_round=None):
-        evidence = self._normalize_factual_evidence(factual_evidence or {})
-        target_source = self._target_source(target)
+    target_label = self.spec.random_of.get(target_source, target_source)
+    answer = distribution.get(target_state, 0.0)
 
-        weights = {state: 0.0 for state in self.mechanisms[target_source].states}
-        evidence_weight = 0.0
+    do_txt = ", ".join(
+        f"{v}={val}" for v, val in sorted(self.spec.interventions.items())
+    )
+    ev_txt = ", ".join(
+        f"{v}={val}" for v, val in sorted(evidence.items())
+    ) or "none"
 
-        for response_tables, response_weight in self._iter_response_tables():
-            # 1. Abduction: evaluate the factual world
-            factual_world = self._evaluate_world(
-                response_tables,
-                interventions={}
-            )
+    dist_txt = ", ".join(
+        f"P({target_label}={s})={p:.{n_round}f}"
+        for s, p in sorted(distribution.items(), key=lambda kv: str(kv[0]))
+    )
 
-            # Keep only worlds compatible with factual evidence
-            if not self._world_matches(factual_world, evidence):
-                continue
+    return "\n".join([
+        f"Step 1 (Query). Compute P({target_label} = {target_state} | {ev_txt}): the "
+        f"probability that {target_source} would equal {target_state} under do({do_txt}), "
+        f"given the factual observation(s) [{ev_txt}].",
 
-            evidence_weight += response_weight
+        "Step 2 (Response-function representation, Balke & Pearl 1994). Each source "
+        "mechanism P(V | parents) is represented as an exogenous response variable r_V. "
+        "The factual world and the do()-world share the same response functions; "
+        "they differ only via the intervention.",
 
-            # 2. Action: apply the SWIG intervention
-            counterfactual_world = self._evaluate_world(
-                response_tables,
-                interventions=self.swig.spec.interventions
-            )
+        f"Step 3 (Abduction). Restrict to the response-function draws whose factual world "
+        f"matches the evidence [{ev_txt}]. Their cumulative mass is "
+        f"P(evidence) = {evidence_mass:.{n_round}f}.",
 
-            # 3. Prediction: accumulate the target value
-            target_value = counterfactual_world[target_source]
-            weights[target_value] += response_weight
-        if evidence_weight == 0:
-            raise ValueError(
-                "The factual evidence has probability zero under the model."
-            )
-        distribution = {
-            state: weight / evidence_weight
-            for state, weight in weights.items()
-        }
-        if n_round is not None:
-            distribution = {
-                state: round(probability, n_round)
-                for state, probability in distribution.items()
-            }
-        return distribution
+        f"Step 4 (Action). Force do({do_txt}) in the counterfactual world.",
 
+        f"Step 5 (Prediction). Propagate the same response functions under do(); the "
+        f"counterfactual distribution of {target_label} is [{dist_txt}], hence "
+        f"P({target_label} = {target_state}) = {answer:.{n_round}f}.",
+    ])
+
+    
     def _target_source(self, target: Any) -> str:
         """Resout une cible (variable source OU noeud SWIG) vers sa variable source."""
         t = str(target)
@@ -766,6 +749,91 @@ class SwigCounterfactualEngine:
             source = self._target_source(key)
             normalized[source] = value
         return normalized
+        def _stored_225_query(self) -> Tuple[str, Dict[str, Any]]:
+    """Return the L2.25 query stored on the SWIG.
+
+    The SWIG is responsible for generating and storing the query.
+    The engine is responsible for computing it.
+    """
+    if self.swig.target is None:
+        raise ValueError(
+            "Aucune requete L2.25 stockee : appeler swig.generate_225() d'abord."
+        )
+
+    target_source = self._target_source(self.swig.target)
+    evidence = self._normalize_factual_evidence(self.swig.observations or {})
+    return target_source, evidence
+
+def query(self) -> Dict[Any, float]:
+    """Return only the distribution for the stored L2.25 query."""
+    distribution, _ = self.compute_cbn_225()
+    return distribution
+
+
+def answer(self, *, target_state: Any = 1) -> float:
+    """Return only P(target = target_state) for the stored L2.25 query."""
+    distribution, _ = self.compute_cbn_225(target_state=target_state)
+    return distribution.get(target_state, 0.0)
+
+
+def _complete_distribution(
+    self,
+    target_source: str,
+    distribution: Mapping[Any, float],
+) -> Dict[Any, float]:
+    """Add missing target states with probability 0.0."""
+    return {
+        state: distribution.get(state, 0.0)
+        for state in self.mechanisms[target_source].states
+    }
+
+
+@staticmethod
+def _round_distribution(
+    distribution: Mapping[Any, float],
+    n_round: Optional[int],
+) -> Dict[Any, float]:
+    """Round probabilities only when requested."""
+    if n_round is None:
+        return dict(distribution)
+
+    return {
+        state: round(probability, n_round)
+        for state, probability in distribution.items()
+    }
+    def compute_cbn_225(
+        self,
+        *,
+        n_round: Optional[int] = None,
+        target_state: Any = 1,
+) -> Tuple[Dict[Any, float], str]:
+    """Compute the stored CBN2.25 query.
+
+    The query must have been prepared by `swig.generate_225()`.
+
+    Returns
+    -------
+    tuple
+        (distribution, cot)
+    """
+    target_source, evidence = self._stored_225_query()
+
+    distribution, evidence_mass = self._distribution_and_mass(
+        target_source,
+        evidence
+    )
+
+    distribution = self._complete_distribution(target_source, distribution)
+    distribution = self._round_distribution(distribution, n_round)
+
+    cot = self.get_cot(
+        target_state=target_state,
+        distribution=distribution,
+        evidence_mass=evidence_mass,
+        n_round=n_round if n_round is not None else 6,
+    )
+
+    return distribution, cot
 
 Swig.to_nl = to_nl_DBN
 TabularCPD.to_nl = to_nl_CPD
