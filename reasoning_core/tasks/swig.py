@@ -743,19 +743,19 @@ class SwigCounterfactualEngine:
         evidence = self._normalize_factual_evidence(self.swig.observations or {})
         return target_source, evidence
 
-def query(self) -> Dict[Any, float]:
+    def query(self) -> Dict[Any, float]:
     """Return only the distribution for the stored L2.25 query."""
     distribution, _ = self.compute_cbn_225()
     return distribution
 
 
-def answer(self, *, target_state: Any = 1) -> float:
+    def answer(self, *, target_state: Any = 1) -> float:
     """Return only P(target = target_state) for the stored L2.25 query."""
     distribution, _ = self.compute_cbn_225(target_state=target_state)
     return distribution.get(target_state, 0.0)
 
 
-def _complete_distribution(self,target_source: str,distribution: Mapping[Any, float]) -> Dict[Any, float]:
+    def _complete_distribution(self,target_source: str,distribution: Mapping[Any, float]) -> Dict[Any, float]:
     """Add missing target states with probability 0.0."""
     return {
         state: distribution.get(state, 0.0)
