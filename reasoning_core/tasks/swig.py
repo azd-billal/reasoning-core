@@ -17,7 +17,9 @@ from reasoning_core.tasks._causal_utils import to_nl_DBN, to_nl_CPD
 class SwigConfig(Config):
     num_nodes: int = 5
     graph_density: float = 0.4
-    num_latents: int = 1
+    # Nombre de confondeurs latents (causes communes cachees). 0 = SCM markovien ;
+    # >0 = SCM semi-markovien (cf. _random_confounded_bn / SwigCounterfactualEngine).
+    num_confounders: int = 0
     cardinality: int = 2
     random_seed: Optional[int] = None
     max_response_functions: int = 200_000
@@ -25,8 +27,67 @@ class SwigConfig(Config):
     def update(self, c: float) -> None:
         self.num_nodes = max(2, int(self.num_nodes * (1 + c)))
         self.graph_density = min(0.8, self.graph_density + 0.1 * c)
-        if self.num_latents > 0:
-            self.num_latents = max(1, int(self.num_latents * (1 + c)))
+        if self.num_confounders > 0:
+            self.num_confounders = max(1, int(self.num_confounders * (1 + c)))
+
+
+def _random_confounded_bn(
+        *,
+        n_nodes: int,
+        edge_prob: float,
+        n_states: int,
+        num_confounders: int,
+        rng: random.Random,
+        node_names: Optional[List[str]] = None,
+) -> DiscreteBayesianNetwork:
+    """Tire un SCM SEMI-MARKOVIEN : un DAG observe (comme `get_random`) PLUS
+    `num_confounders` latentes `U_k` racines, chacune cause commune de 2 noeuds
+    observes tires au hasard (= confounding / arete bidirectionnelle `child_a <-> child_b`).
+
+    Toutes les CPDs sont (re)tirees au hasard sur le graphe complet (etats 0..k-1) ;
+    les `U_k` sont marquees dans `bn.latents` (jamais observees / intervenues / interrogees).
+
+    Point cle : le modele complet sur (observes U latentes) est encore MARKOVIEN, donc
+    le moteur exact par fonctions de reponse s'y applique tel quel -- les latentes,
+    enumerees comme exogenes caches PARTAGES entre le monde factuel et le monde do(),
+    encodent exactement le confounding (cf. SwigCounterfactualEngine)."""
+    # 1. Structure observee : on ne garde QUE les noeuds + aretes de get_random.
+    base = DiscreteBayesianNetwork.get_random(
+        n_nodes=n_nodes,
+        edge_prob=edge_prob,
+        node_names=[str(x) for x in node_names] if node_names is not None else None,
+        n_states=n_states,
+        seed=rng.randrange(2**31),
+    )
+    observed = [str(n) for n in base.nodes()]
+    edges = [(str(u), str(v)) for u, v in base.edges()]
+
+    # 2. Latentes confondantes : racine U_k -> 2 enfants observes distincts.
+    latents: List[str] = []
+    if len(observed) >= 2:
+        for i in range(num_confounders):
+            u = f"U_{i}"
+            latents.append(u)
+            child_a, child_b = rng.sample(observed, 2)
+            edges.append((u, child_a))
+            edges.append((u, child_b))
+
+    # 3. Graphe complet + CPDs (re)tirees uniformement.
+    full = DiscreteBayesianNetwork(edges)
+    full.add_nodes_from(observed + latents)
+    card = {n: n_states for n in observed + latents}
+    cpds = [
+        TabularCPD.get_random(
+            variable=node,
+            evidence=list(full.predecessors(node)),
+            cardinality=card,
+            seed=rng.randrange(2**31),
+        )
+        for node in full.nodes()
+    ]
+    full.add_cpds(*cpds)
+    full.latents = set(latents)
+    return full
 
 
 class Swig(DiscreteBayesianNetwork):
@@ -43,6 +104,11 @@ class Swig(DiscreteBayesianNetwork):
     aucune CPD materialisee. Le monde contrefactuel est entierement determine par
     (source_bn, intervention) ; quelles variables heritent la valeur x (les
     descendants de X) se lit a la demande sur `source_bn`.
+
+    Le SCM source est markovien par defaut, ou SEMI-MARKOVIEN si on demande des
+    confondeurs latents (`generate_random_swig(num_confounders>0)` /
+    `config.num_confounders`) : les latentes sont des noeuds explicites de `source_bn`
+    (marques dans `source_bn.latents`), jamais observees/intervenues/interrogees.
 
     Repartition des roles (volontaire) :
       - `self.source_bn` + `self.intervention` SONT le SWIG ;
@@ -73,7 +139,6 @@ class Swig(DiscreteBayesianNetwork):
         # Requete L2.25 stockee par generate_225 (la formule LaTeX est renvoyee).
         self.target: Optional[str] = None
         self.observations: Optional[Dict[str, Any]] = None
-        self.situation_initiale: Optional[Dict[str, Any]] = None
         self.swig_description: Optional[str] = None
         self.engine: Optional["SwigCounterfactualEngine"] = None
 
@@ -85,18 +150,20 @@ class Swig(DiscreteBayesianNetwork):
             interventions: Optional[Mapping[str, Any]] = None,
             node_names: Optional[List[str]] = None,
             cardinality: Optional[int] = None,
+            num_confounders: Optional[int] = None,
             bn: Optional[DiscreteBayesianNetwork] = None,
     ) -> "Swig":
         """Construit un SWIG aleatoire de bout en bout.
 
         1. BN source : `bn` (argument) s'il est fourni, sinon `self.source_bn`
-           (BN impose au constructeur via `bn=`), sinon tire par pgmpy
-           `DiscreteBayesianNetwork.get_random` (DAG + CPDs, cardinalite
-           `config.cardinality`).
+           (BN impose au constructeur via `bn=`), sinon tire aleatoirement (DAG + CPDs,
+           cardinalite `config.cardinality`). Markovien par defaut (`get_random`) ;
+           SEMI-MARKOVIEN si `num_confounders > 0` (latentes confondantes, via
+           `_random_confounded_bn`).
         2. Intervention : `interventions` si fournie ; SINON choisie AU HASARD
-           (un noeud ayant des descendants + une valeur au hasard). Le graphe etant
-           tire aleatoirement, on ne connait pas sa structure a l'avance : on ne peut
-           donc pas exiger l'intervention du dehors, on la tire ici.
+           (un noeud OBSERVE ayant des descendants + une valeur au hasard). Le graphe
+           etant tire aleatoirement, on ne connait pas sa structure a l'avance : on ne
+           peut donc pas exiger l'intervention du dehors, on la tire ici.
         3. On STOCKE simplement (`self.source_bn`, `self.intervention`) -- pas de
            node-splitting, "la partie fixee" est juste l'intervention.
 
@@ -104,7 +171,8 @@ class Swig(DiscreteBayesianNetwork):
 
         Parametres (defauts dans `self.config`) : `nb_nodes`, `prob_link`
         (densite d'aretes), `node_names` (sa longueur prime sur nb_nodes),
-        `cardinality`, `bn` (BN source impose, p.ex. pour tests).
+        `cardinality`, `num_confounders` (latentes ; defaut `config.num_confounders`),
+        `bn` (BN source impose, p.ex. pour tests).
         """
         if nb_nodes is not None:
             self.config.num_nodes = nb_nodes
@@ -112,19 +180,33 @@ class Swig(DiscreteBayesianNetwork):
             self.config.graph_density = prob_link
         if cardinality is not None:
             self.config.cardinality = cardinality
+        n_conf = (
+            num_confounders if num_confounders is not None
+            else getattr(self.config, "num_confounders", 0)
+        )
 
         if bn is None:
             bn = self.source_bn   # BN impose au constructeur, si fourni
         if bn is None:
             k = self.config.cardinality
             n_nodes = len(node_names) if node_names is not None else self.config.num_nodes
-            bn = DiscreteBayesianNetwork.get_random(
-                n_nodes=n_nodes,
-                edge_prob=self.config.graph_density,
-                node_names=[str(x) for x in node_names] if node_names is not None else None,
-                n_states=k,
-                seed=self._rng.randrange(2**31),
-            )
+            if n_conf > 0:
+                bn = _random_confounded_bn(
+                    n_nodes=n_nodes,
+                    edge_prob=self.config.graph_density,
+                    n_states=k,
+                    num_confounders=n_conf,
+                    rng=self._rng,
+                    node_names=node_names,
+                )
+            else:
+                bn = DiscreteBayesianNetwork.get_random(
+                    n_nodes=n_nodes,
+                    edge_prob=self.config.graph_density,
+                    node_names=[str(x) for x in node_names] if node_names is not None else None,
+                    n_states=k,
+                    seed=self._rng.randrange(2**31),
+                )
 
         if interventions is None:
             interventions = self._random_intervention(bn)
@@ -139,12 +221,15 @@ class Swig(DiscreteBayesianNetwork):
         return self
 
     def _random_intervention(self, bn: DiscreteBayesianNetwork) -> Dict[str, Any]:
-        """Choisit au hasard une intervention do(X=v) valide : X doit avoir au moins
-        un descendant (sinon la requete contrefactuelle serait triviale). Lu
-        DIRECTEMENT sur `bn` (aucun graphe reconstruit)."""
-        candidates = sorted(n for n in bn.nodes() if bn.out_degree(n) > 0)
+        """Choisit au hasard une intervention do(X=v) valide : X doit etre OBSERVE
+        (jamais une latente) et avoir au moins un descendant (sinon la requete
+        contrefactuelle serait triviale). Lu DIRECTEMENT sur `bn`."""
+        latents = {str(u) for u in getattr(bn, "latents", set())}
+        candidates = sorted(
+            n for n in bn.nodes() if bn.out_degree(n) > 0 and str(n) not in latents
+        )
         if not candidates:
-            raise ValueError("Aucune variable avec descendant : SWIG trivial.")
+            raise ValueError("Aucune variable observee avec descendant : SWIG trivial.")
         x_var = self._rng.choice(candidates)
         x_states = list(bn.get_cpds(x_var).state_names[x_var])
         return {str(x_var): self._rng.choice(x_states)}
@@ -157,8 +242,8 @@ class Swig(DiscreteBayesianNetwork):
             observations: Optional[Mapping[str, Any]] = None,
     ) -> str:
         """Construit une requete L2.25 sur ce SWIG, la STOCKE sur l'objet
-        (`self.target`, `self.observations`, `self.situation_initiale`,
-        `self.swig_description`, `self.engine`) et RENVOIE sa formule en LaTeX
+        (`self.target`, `self.observations`, `self.swig_description`, `self.engine` ;
+        l'intervention reste dans `self.intervention`) et RENVOIE sa formule en LaTeX
         (ex. `P\\left(Y_{X=x} \\mid Z=z\\right)`). La REPONSE numerique se calcule
         a part avec `self.engine.compute_cbn_225()`.
 
@@ -196,14 +281,17 @@ class Swig(DiscreteBayesianNetwork):
         bn = self.source_bn
         source_nodes = [str(n) for n in bn.nodes()]
         node_by_str = {str(n): n for n in bn.nodes()}
+        # Latentes (confondeurs) : jamais observees ni interrogees.
+        latents: Set[str] = {str(u) for u in getattr(bn, "latents", set())}
         # Descendants de l'intervention, lus DIRECTEMENT sur source_bn : ce sont les
-        # variables contrefactuelles (elles heritent la valeur d'intervention x).
+        # variables contrefactuelles (elles heritent la valeur d'intervention x). Les
+        # latentes sont des racines, donc jamais des descendants.
         post_treatment: Set[str] = set()
         for x_var in self.intervention:
             post_treatment |= {str(d) for d in nx.descendants(bn, node_by_str[x_var])}
 
         if target is None:
-            candidates = sorted(post_treatment)
+            candidates = sorted(post_treatment - latents)
             if not candidates:
                 raise ValueError("Aucun descendant contrefactuel a interroger.")
             target_source = self._rng.choice(candidates)
@@ -211,14 +299,15 @@ class Swig(DiscreteBayesianNetwork):
             target_source = str(target)
 
         # L2.25 STRICT (Def. 11 + Ex. 6 du papier) : on ne conditionne QUE sur des
-        # variables NON descendantes de l'intervention. Conditionner sur la valeur
-        # FACTUELLE d'un descendant de X donnerait du L3 (hors L2.25). La valeur
-        # factuelle de X lui-meme reste permise.
+        # variables NON descendantes de l'intervention (et jamais sur une latente).
+        # Conditionner sur la valeur FACTUELLE d'un descendant de X donnerait du L3
+        # (hors L2.25). La valeur factuelle de X lui-meme reste permise.
         if observations is None:
             sample = bn.simulate(n_samples=1, show_progress=False).iloc[0]
             obs: Dict[str, Any] = {}
             for var in source_nodes:
-                if var == target_source or var in post_treatment or var not in sample.index:
+                if (var == target_source or var in post_treatment
+                        or var in latents or var not in sample.index):
                     continue
                 value = sample[var]
                 obs[var] = value.item() if hasattr(value, "item") else value
@@ -226,18 +315,16 @@ class Swig(DiscreteBayesianNetwork):
             obs = {}
             for key, value in observations.items():
                 k = str(key)
-                if k in post_treatment:
+                if k in latents:
                     raise ValueError(
-                        f"Observation L2.25 invalide : {key!r} est un descendant de "
-                        f"l'intervention. Conditionner sur sa valeur factuelle donne une "
-                        f"requete inter-mondes (L3), hors L2.25."
+                        f"Observation invalide : {key!r} est une variable latente "
+                        f"(confondeur non observable)."
                     )
                 obs[k] = value
 
-        # On STOCKE la requete sur le SWIG...
+        # On STOCKE la requete sur le SWIG... (l'intervention reste dans `self.intervention`).
         self.target = target_source
         self.observations = obs
-        self.situation_initiale = dict(self.intervention)
         self.swig_description = to_nl_DBN(self.source_bn)
         self.engine = SwigCounterfactualEngine(self)
 
@@ -294,8 +381,14 @@ class SwigCounterfactualEngine:
       3. PREDICTION : propager les memes `r_V` dans le monde do() et lire la cible.
     Abduction et prediction se calculent en une passe (les deux mondes evalues sous
     le meme tirage de `r_V`). Prior sur les `r_V` : CANONIQUE, derive des CPDs du SCM
-    source (reponses independantes entre configurations de parents -- le modele
-    markovien standard que produit get_random).
+    source (reponses independantes entre configurations de parents).
+
+    SEMI-MARKOVIEN (confondeurs) : les confondeurs latents sont representes par des
+    noeuds latents EXPLICITES dans `source_bn` (cf. `_random_confounded_bn`). Comme le
+    modele complet (observes + latentes) reste markovien, ils sont enumeres comme des
+    `r_U` caches, PARTAGES entre le monde factuel et le monde do() : ce partage encode
+    exactement le confounding, et l'enumeration canonique reste donc EXACTE. Ces
+    latentes ne sont jamais observees, intervenues ni interrogees (cf. `observed_nodes`).
     """
 
     def __init__(self, swig: Swig, *, max_response_functions: Optional[int] = None):
@@ -303,13 +396,17 @@ class SwigCounterfactualEngine:
             raise ValueError("Le moteur exige swig.source_bn (le SCM source).")
         if not swig.intervention:
             raise ValueError("Le moteur exige un SWIG construit avec intervention(s).")
-        if getattr(swig.source_bn, "latents", set()):
-            raise ValueError("SCM markovien requis : pas de variable latente.")
         self.swig = swig
         self.source_bn = swig.source_bn
         # Le SWIG n'est que (source_bn, intervention) : on lit tout directement.
         self.intervention: Dict[str, Any] = dict(swig.intervention)
+        # `source_nodes` = TOUS les noeuds, latentes INCLUSES : les confondeurs latents
+        # sont enumeres comme des exogenes caches PARTAGES entre le monde factuel et le
+        # monde do() (c'est ce qui encode le confounding). `observed_nodes` = ceux qu'on
+        # peut observer / intervenir / interroger.
         self.source_nodes: List[str] = [str(n) for n in self.source_bn.nodes()]
+        self.latents: Set[str] = {str(u) for u in getattr(self.source_bn, "latents", set())}
+        self.observed_nodes: List[str] = [n for n in self.source_nodes if n not in self.latents]
         # Plafond d'enumeration : argument explicite sinon `config.max_response_functions`.
         self.max_response_functions = (
             max_response_functions
@@ -519,11 +616,13 @@ class SwigCounterfactualEngine:
 
     
     def _target_source(self, target: Any) -> str:
-        """Verifie que la cible est bien une variable du SCM source (plus de labels
-        scindes : la cible est directement une variable source)."""
+        """Verifie que la cible/evidence est une variable OBSERVEE du SCM source (plus
+        de labels scindes ; une latente n'est ni observable ni interrogeable)."""
         t = str(target)
-        if t in self.source_nodes:
+        if t in self.observed_nodes:
             return t
+        if t in self.latents:
+            raise ValueError(f"Variable latente non observable/interrogeable : {target!r}.")
         raise ValueError(f"Cible inconnue : {target!r}.")
 
     def _normalize_factual_evidence(self, evidence: Mapping[Any, Any]) -> Dict[str, Any]:
