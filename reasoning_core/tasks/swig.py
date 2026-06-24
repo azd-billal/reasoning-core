@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import copy
 import itertools
 import random
-from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 
 import networkx as nx
-import numpy as np
 
 from pgmpy.models import DiscreteBayesianNetwork
 from pgmpy.factors.discrete import TabularCPD
@@ -31,35 +29,6 @@ class SwigConfig(Config):
             self.num_latents = max(1, int(self.num_latents * (1 + c)))
 
 
-@dataclass(frozen=True)
-class SwigNodeInfo:
-    label: str
-    source: str
-    kind: str
-    value: Optional[Any] = None
-    fixed_ancestors: Tuple[str, ...] = ()
-
-    @property
-    def is_fixed(self) -> bool:
-        return self.kind == "fixed"
-
-    @property
-    def is_random(self) -> bool:
-        return self.kind == "random"
-
-
-@dataclass
-class SwigSpec:
-    source_nodes: Tuple[str, ...] = ()
-    source_edges: Tuple[Tuple[str, str], ...] = ()
-    interventions: Dict[str, Any] = field(default_factory=dict)
-    random_of: Dict[str, str] = field(default_factory=dict)
-    fixed_of: Dict[str, str] = field(default_factory=dict)
-    source_of: Dict[str, str] = field(default_factory=dict)
-    node_info: Dict[str, SwigNodeInfo] = field(default_factory=dict)
-
-
-
 class Swig(DiscreteBayesianNetwork):
     """Single-World Intervention Graph (Richardson & Robins, 2013).
 
@@ -68,35 +37,40 @@ class Swig(DiscreteBayesianNetwork):
     chaque variable d'intervention X est scindee en un noeud FIXE `do(X=v)` et un
     noeud ALEATOIRE indexe `Y(x)`.
 
+    SWIG SIMPLIFIE : l'objet ne stocke QUE le SCM source `self.source_bn` (avec ses
+    CPDs) et l'intervention `self.intervention` (dict `{X: x}`, "la partie fixee").
+    On ne fait PLUS de node-splitting : aucun graphe scinde, aucun label `Y(X=v)`,
+    aucune CPD materialisee. Le monde contrefactuel est entierement determine par
+    (source_bn, intervention) ; quelles variables heritent la valeur x (les
+    descendants de X) se lit a la demande sur `source_bn`.
+
     Repartition des roles (volontaire) :
-      - le **graphe scinde** materialise dans `self` (+ `SwigSpec`) est la
-        REPRESENTATION du monde contrefactuel, consommee par `to_nl` pour produire
-        l'enonce des taches ;
+      - `self.source_bn` + `self.intervention` SONT le SWIG ;
       - le **SCM source** (`self.source_bn`, avec ses CPDs) porte les mecanismes ;
       - le **calcul numerique** des contrefactuels n'est PAS dans cette classe : il
-        est fait par `SwigCounterfactualEngine`, qui lit `source_bn` + `spec`.
+        est fait par `SwigCounterfactualEngine`, qui lit `source_bn` + `intervention`.
 
-    Surface : `generate_random_swig` / `generate_225` (tirage + node-splitting) et
-    `to_nl` (description en langage naturel).
+    Surface : `generate_random_swig` (tirage du SCM + choix de l'intervention),
+    `_random_intervention` (intervention au hasard) et `generate_225` (construit une
+    requete L2.25 et renvoie sa formule LaTeX).
     """
 
     def __init__(
             self,
             config: Optional[SwigConfig] = None,
             *,
-            ebunch: Optional[Iterable[Tuple[str, str]]] = None,
-            spec: Optional[SwigSpec] = None,
             bn: Optional[DiscreteBayesianNetwork] = None,
     ):
-        super().__init__(ebunch)
+        super().__init__()
         self.config = config if config is not None else SwigConfig()
         self._rng = random.Random(self.config.random_seed)
-        self.spec = spec if spec is not None else SwigSpec()
-        self.latents: Set[str] = set()
+        # Un SWIG n'est QUE (source_bn, intervention) : on stocke ici l'intervention
+        # do(X=x), "la partie fixee". Aucun graphe scinde, aucune CPD materialisee.
+        self.intervention: Dict[str, Any] = {}
         # BN source (SCM). Peut etre fourni au constructeur (`bn=`) pour imposer le
         # reseau voulu ; sinon rempli par generate_random_swig (tirage aleatoire).
         self.source_bn: Optional[DiscreteBayesianNetwork] = bn
-        # Requete L2.25 stockee par generate_225 (au lieu d'etre renvoyee).
+        # Requete L2.25 stockee par generate_225 (la formule LaTeX est renvoyee).
         self.target: Optional[str] = None
         self.observations: Optional[Dict[str, Any]] = None
         self.situation_initiale: Optional[Dict[str, Any]] = None
@@ -110,7 +84,6 @@ class Swig(DiscreteBayesianNetwork):
             *,
             interventions: Optional[Mapping[str, Any]] = None,
             node_names: Optional[List[str]] = None,
-            num_latents: Optional[int] = None,
             cardinality: Optional[int] = None,
             bn: Optional[DiscreteBayesianNetwork] = None,
     ) -> "Swig":
@@ -124,21 +97,19 @@ class Swig(DiscreteBayesianNetwork):
            (un noeud ayant des descendants + une valeur au hasard). Le graphe etant
            tire aleatoirement, on ne connait pas sa structure a l'avance : on ne peut
            donc pas exiger l'intervention du dehors, on la tire ici.
-        3. Node-splitting (SWIG-1.pdf, section 3) puis pose des CPDs sur le graphe
-           scinde (memes valeurs que le BN source, cf. `_build_swig_cpds`).
+        3. On STOCKE simplement (`self.source_bn`, `self.intervention`) -- pas de
+           node-splitting, "la partie fixee" est juste l'intervention.
 
         Un SWIG est toujours defini par une intervention (jamais de "mode source").
 
         Parametres (defauts dans `self.config`) : `nb_nodes`, `prob_link`
         (densite d'aretes), `node_names` (sa longueur prime sur nb_nodes),
-        `num_latents`, `cardinality`, `bn` (BN source impose, p.ex. pour tests).
+        `cardinality`, `bn` (BN source impose, p.ex. pour tests).
         """
         if nb_nodes is not None:
             self.config.num_nodes = nb_nodes
         if prob_link is not None:
             self.config.graph_density = prob_link
-        if num_latents is not None:
-            self.config.num_latents = num_latents
         if cardinality is not None:
             self.config.cardinality = cardinality
 
@@ -157,163 +128,26 @@ class Swig(DiscreteBayesianNetwork):
 
         if interventions is None:
             interventions = self._random_intervention(bn)
-        return self._node_split(bn, interventions)
+        # Node-splitting reduit a "mettre l'intervention dans une variable" : on stocke
+        # juste le SCM source et l'intervention do(X=x), rien d'autre.
+        self.source_bn = bn
+        normalized = {str(var): value for var, value in dict(interventions).items()}
+        missing = set(normalized) - {str(n) for n in bn.nodes()}
+        if missing:
+            raise ValueError(f"Unknown intervention variables: {sorted(missing)}")
+        self.intervention = normalized
+        return self
 
     def _random_intervention(self, bn: DiscreteBayesianNetwork) -> Dict[str, Any]:
         """Choisit au hasard une intervention do(X=v) valide : X doit avoir au moins
-        un descendant (sinon la requete contrefactuelle serait triviale)."""
-        graph = nx.DiGraph()
-        graph.add_nodes_from(str(n) for n in bn.nodes())
-        graph.add_edges_from((str(u), str(v)) for u, v in bn.edges())
-        candidates = sorted(n for n in graph.nodes() if graph.out_degree(n) > 0)
+        un descendant (sinon la requete contrefactuelle serait triviale). Lu
+        DIRECTEMENT sur `bn` (aucun graphe reconstruit)."""
+        candidates = sorted(n for n in bn.nodes() if bn.out_degree(n) > 0)
         if not candidates:
             raise ValueError("Aucune variable avec descendant : SWIG trivial.")
         x_var = self._rng.choice(candidates)
         x_states = list(bn.get_cpds(x_var).state_names[x_var])
-        return {x_var: self._rng.choice(x_states)}
-
-    def _node_split(
-            self,
-            bn: DiscreteBayesianNetwork,
-            interventions: Mapping[str, Any],
-            *,
-            num_latents: Optional[int] = None,
-    ) -> "Swig":
-        """Node-splitting du reseau source `bn`
-        sous `interventions` : remplit `self.source_bn`, `self.spec`, `self.latents`,
-        materialise le graphe scinde dans `self` et y pose les CPDs. Appele par
-        generate_random_swig. `num_latents` (sinon `self.config.num_latents`) permet
-        de forcer le nombre de latentes SANS muter la config."""
-        # Repartir d'un graphe propre : permet de re-scinder le MEME objet sous une
-        # autre intervention (p.ex. generate_225(intervention=...) appele plusieurs
-        # fois), sans accumuler les noeuds/CPDs de la scission precedente.
-        existing_cpds = self.get_cpds()
-        if existing_cpds:
-            self.remove_cpds(*existing_cpds)
-        if self.nodes():
-            self.remove_nodes_from(list(self.nodes()))
-        self.source_bn = bn
-        source_nodes = tuple(str(n) for n in bn.nodes())
-        source_edges = tuple((str(u), str(v)) for u, v in bn.edges())
-
-        requested = self.config.num_latents if num_latents is None else num_latents
-        n_latents = min(requested, max(0, len(source_nodes) - 1))
-        if n_latents > 0:
-            ordered = sorted(source_nodes)
-            confounders = [n for n in ordered if bn.out_degree(n) >= 2]
-            others = [n for n in ordered if bn.out_degree(n) < 2]
-            n_conf = min(n_latents, len(confounders))
-            source_latents = set(self._rng.sample(confounders, n_conf))
-            source_latents.update(self._rng.sample(others, n_latents - n_conf))
-        else:
-            source_latents = set()
-
-        normalized = {str(var): value for var, value in dict(interventions).items()}
-        missing = set(normalized) - set(source_nodes)
-        if missing:
-            raise ValueError(f"Unknown intervention variables: {sorted(missing)}")
-
-        fixed_of = {var: f"do({var}={value})" for var, value in normalized.items()}
-
-        temp = nx.DiGraph()
-        temp.add_nodes_from(source_nodes)
-        temp.add_nodes_from(fixed_of.values())
-        for parent, child in source_edges:
-            temp.add_edge(fixed_of[parent] if parent in fixed_of else parent, child)
-
-        fixed_labels = set(fixed_of.values())
-        fixed_var_by_label = {label: var for var, label in fixed_of.items()}
-        random_of: Dict[str, str] = {}
-        node_info: Dict[str, SwigNodeInfo] = {}
-        source_of: Dict[str, str] = {}
-
-        for source_var in source_nodes:
-            fixed_anc_labels = sorted(nx.ancestors(temp, source_var) & fixed_labels)
-            fixed_anc_vars = tuple(fixed_var_by_label[label] for label in fixed_anc_labels)
-            if fixed_anc_vars:
-                suffix = ",".join(f"{a}={normalized[a]}" for a in sorted(fixed_anc_vars))
-                label = f"{source_var}({suffix})"
-            else:
-                label = source_var
-            random_of[source_var] = label
-            source_of[label] = source_var
-            node_info[label] = SwigNodeInfo(
-                label=label, source=source_var, kind="random",
-                fixed_ancestors=fixed_anc_vars,
-            )
-        for source_var, label in fixed_of.items():
-            source_of[label] = source_var
-            node_info[label] = SwigNodeInfo(
-                label=label, source=source_var, kind="fixed",
-                value=normalized[source_var],
-            )
-        if len(node_info) != len(source_nodes) + len(fixed_of):
-            raise ValueError("SWIG labels are not unique.")
-
-        self.spec = SwigSpec(
-            source_nodes=source_nodes, source_edges=source_edges,
-            interventions=normalized, random_of=random_of,
-            fixed_of=fixed_of, source_of=source_of, node_info=node_info,
-        )
-        self.add_nodes_from(node_info)
-        for parent, child in source_edges:
-            swig_parent = fixed_of[parent] if parent in fixed_of else random_of[parent]
-            self.add_edge(swig_parent, random_of[child])
-        # Les latentes du DAG source restent latentes dans le SWIG, representees
-        # par leur moitie aleatoire (un noeud du SWIG).
-        self.latents = {random_of[n] for n in source_latents if n in random_of}
-        self._build_swig_cpds()
-        return self
-
-    def _build_swig_cpds(self) -> None:
-        """Pose les CPDs sur le graphe scinde `self` pour en faire un reseau
-        bayesien complet (ce qui justifie l'heritage DiscreteBayesianNetwork).
-
-        Le node-splitting SEPARE chaque variable, il n'en cree pas : les VALEURS des
-        CPDs sont donc IDENTIQUES a celles du BN source (jamais recalculees) :
-          - noeud aleatoire (moitie naturelle, ex. `X` ou un enfant `Y(X=v)`) : meme
-            CPD que dans le BN source. Si le label est inchange (`label == source`) on
-            REUTILISE la CPD telle quelle ; si le noeud est renomme (descendant de
-            l'intervention) on reconstruit la TabularCPD avec les parents REETIQUETES
-            vers les noeuds du SWIG, en gardant les MEMES valeurs (pgmpy ne sait pas
-            renommer une CPD existante) ;
-          - noeud fixe `do(X=v)` (l'autre moitie, l'intervention) : masse-point
-            P(do(X=v)=v)=1. Ce n'est pas une CPD du BN mais l'encodage de "cette
-            moitie vaut v" -- l'intervention elle-meme. Ce noeud est absent du BN
-            source (cree par la scission), donc construit ici."""
-        cpds: List[TabularCPD] = []
-        for src, label in self.spec.fixed_of.items():
-            states = list(self.source_bn.get_cpds(src).state_names[src])
-            col = np.zeros((len(states), 1))
-            col[states.index(self.spec.interventions[src]), 0] = 1.0
-            cpds.append(TabularCPD(label, len(states), col, state_names={label: states}))
-        for src in self.spec.source_nodes:
-            cpd = self.source_bn.get_cpds(src)
-            label = self.spec.random_of[src]
-            if label == src:                       # rien renomme -> CPD source reutilisee
-                cpds.append(cpd.copy())
-                continue
-            src_par = [str(p) for p in cpd.variables[1:]]
-            swig_par = [self.spec.fixed_of.get(p, self.spec.random_of[p]) for p in src_par]
-            state_names = {label: list(cpd.state_names[cpd.variable])}
-            for sp, p in zip(swig_par, src_par):
-                state_names[sp] = list(cpd.state_names[p])
-            kwargs: Dict[str, Any] = dict(
-                variable=label, variable_card=int(cpd.variable_card),
-                values=cpd.get_values(), state_names=state_names,
-            )
-            if swig_par:
-                kwargs["evidence"] = swig_par
-                kwargs["evidence_card"] = [int(c) for c in cpd.cardinality[1:]]
-            cpds.append(TabularCPD(**kwargs))
-        self.add_cpds(*cpds)
-        if not self.check_model():
-            raise RuntimeError("CPDs du SWIG mal formees.")
-            self.target = None
-            self.observations = None
-            self.situation_initiale = None
-            self.swig_description = None
-            self.engine = None
+        return {str(x_var): self._rng.choice(x_states)}
 
     def generate_225(
             self,
@@ -321,16 +155,15 @@ class Swig(DiscreteBayesianNetwork):
             intervention: Optional[Mapping[str, Any]] = None,
             target: Optional[Any] = None,
             observations: Optional[Mapping[str, Any]] = None,
-    ) -> "Swig":
-        """Construit une requete L2.25 sur ce SWIG et la STOCKE sur l'objet
+    ) -> str:
+        """Construit une requete L2.25 sur ce SWIG, la STOCKE sur l'objet
         (`self.target`, `self.observations`, `self.situation_initiale`,
-        `self.swig_description`), au lieu de renvoyer un dico. Renvoie `self`
-        (chainage). La REPONSE se calcule a part avec
-        `SwigCounterfactualEngine(self).compute_cbn_225(self.target, self.observations)`.
+        `self.swig_description`, `self.engine`) et RENVOIE sa formule en LaTeX
+        (ex. `P\\left(Y_{X=x} \\mid Z=z\\right)`). La REPONSE numerique se calcule
+        a part avec `self.engine.compute_cbn_225()`.
 
         Une intervention `{X = x}` definit le monde contrefactuel : par la condition
-        (ii) de la Def. 11, la MEME valeur `x` se propage a TOUS les descendants de X
-        -- exactement le node-splitting du SWIG.
+        (ii) de la Def. 11, la MEME valeur `x` se propage a TOUS les descendants de X.
 
         L2.25 STRICT : la requete ne conditionne QUE sur des variables NON descendantes
         de l'intervention (Def. 11, Ex. 6). Conditionner sur la valeur factuelle d'un
@@ -338,11 +171,10 @@ class Swig(DiscreteBayesianNetwork):
         L2.25. La valeur factuelle de X lui-meme reste permise.
 
         Parametres (tous optionnels) :
-          - `intervention` : si fournie, (re)scinde le BN source `self.source_bn` sous
-            cette intervention ; sinon on reutilise le SWIG deja construit (p.ex. par
-            `generate_random_swig`).
-          - `target`       : noeud contrefactuel interroge (variable source OU noeud
-            SWIG) ; tire au hasard parmi les descendants contrefactuels si omis.
+          - `intervention` : si fournie, (re)definit l'intervention sur `self.source_bn` ;
+            sinon on reutilise le SWIG deja construit (p.ex. par `generate_random_swig`).
+          - `target`       : variable source contrefactuelle interrogee ; tiree au hasard
+            parmi les descendants de l'intervention si omise.
           - `observations` : valeurs factuelles observees ; echantillonnees du SCM
             source (hors cible ET hors descendants de l'intervention) si omises. Si
             fournies, lever ValueError si elles incluent un descendant de l'intervention.
@@ -353,42 +185,39 @@ class Swig(DiscreteBayesianNetwork):
                     "generate_225 avec `intervention` exige un BN source : passer "
                     "`bn=` au constructeur ou appeler generate_random_swig d'abord."
                 )
-            self._node_split(self.source_bn, intervention)
-        if not self.spec.interventions:
+            normalized = {str(k): v for k, v in dict(intervention).items()}
+            missing = set(normalized) - {str(n) for n in self.source_bn.nodes()}
+            if missing:
+                raise ValueError(f"Unknown intervention variables: {sorted(missing)}")
+            self.intervention = normalized
+        if not self.intervention:
             raise ValueError("generate_225 exige un SWIG construit avec intervention(s).")
 
+        bn = self.source_bn
+        source_nodes = [str(n) for n in bn.nodes()]
+        node_by_str = {str(n): n for n in bn.nodes()}
+        # Descendants de l'intervention, lus DIRECTEMENT sur source_bn : ce sont les
+        # variables contrefactuelles (elles heritent la valeur d'intervention x).
+        post_treatment: Set[str] = set()
+        for x_var in self.intervention:
+            post_treatment |= {str(d) for d in nx.descendants(bn, node_by_str[x_var])}
+
         if target is None:
-            # cibles candidates = noeuds aleatoires touches par l'intervention
-            # (ceux qui ont un ancetre fixe), i.e. les descendants contrefactuels.
-            candidates = sorted(
-                lbl for lbl, info in self.spec.node_info.items()
-                if info.is_random and info.fixed_ancestors
-            )
+            candidates = sorted(post_treatment)
             if not candidates:
                 raise ValueError("Aucun descendant contrefactuel a interroger.")
-            target_label = self._rng.choice(candidates)
+            target_source = self._rng.choice(candidates)
         else:
-            src = self.spec.source_of.get(str(target), str(target))
-            target_label = self.spec.random_of[src]
-        target_source = self.spec.source_of[target_label]
+            target_source = str(target)
 
         # L2.25 STRICT (Def. 11 + Ex. 6 du papier) : on ne conditionne QUE sur des
-        # variables NON descendantes de l'intervention. La jointe L2.25 indexee par
-        # {X=x} est P(X, Z_x, Y_x) -- X factuel, descendants tous indices x. Conditionner
-        # sur la valeur FACTUELLE d'un descendant de X melerait deux submodels (p.ex.
-        # P(Y_x, M)), ce qui est du L3, hors L2.25. La valeur factuelle de X lui-meme
-        # reste permise (non indicee dans la jointe).
-        src_graph = nx.DiGraph()
-        src_graph.add_nodes_from(self.spec.source_nodes)
-        src_graph.add_edges_from(self.spec.source_edges)
-        post_treatment: Set[str] = set()
-        for x_var in self.spec.interventions:
-            post_treatment |= nx.descendants(src_graph, x_var)
-
+        # variables NON descendantes de l'intervention. Conditionner sur la valeur
+        # FACTUELLE d'un descendant de X donnerait du L3 (hors L2.25). La valeur
+        # factuelle de X lui-meme reste permise.
         if observations is None:
-            sample = self.source_bn.simulate(n_samples=1, show_progress=False).iloc[0]
+            sample = bn.simulate(n_samples=1, show_progress=False).iloc[0]
             obs: Dict[str, Any] = {}
-            for var in self.spec.source_nodes:
+            for var in source_nodes:
                 if var == target_source or var in post_treatment or var not in sample.index:
                     continue
                 value = sample[var]
@@ -396,45 +225,33 @@ class Swig(DiscreteBayesianNetwork):
         else:
             obs = {}
             for key, value in observations.items():
-                src = self.spec.source_of.get(str(key), str(key))
-                if src in post_treatment:
+                k = str(key)
+                if k in post_treatment:
                     raise ValueError(
                         f"Observation L2.25 invalide : {key!r} est un descendant de "
                         f"l'intervention. Conditionner sur sa valeur factuelle donne une "
                         f"requete inter-mondes (L3), hors L2.25."
                     )
-                obs[str(key)] = value
+                obs[k] = value
 
-        # On STOCKE la requete sur le SWIG plutot que de la renvoyer.
-        self.target = target_label
+        # On STOCKE la requete sur le SWIG...
+        self.target = target_source
         self.observations = obs
-        self.situation_initiale = dict(self.spec.interventions)
-        self.swig_description = self.to_nl()
+        self.situation_initiale = dict(self.intervention)
+        self.swig_description = to_nl_DBN(self.source_bn)
         self.engine = SwigCounterfactualEngine(self)
-        return self
 
-    def copy(self) -> "Swig":
-        """Copie de la STRUCTURE du SWIG (graphe scinde + CPDs + `SwigSpec` +
-        latentes). Le SCM source `source_bn` est PARTAGE (ses CPDs sont en lecture
-        seule pour le moteur contrefactuel), seul le `spec` est recopie en profondeur."""
-        copied = Swig(
-            config=copy.deepcopy(self.config),
-            spec=copy.deepcopy(self.spec),
-            bn=self.source_bn,  # SCM source partage (CPDs en lecture seule)
+        # ... et on RENVOIE sa formule en LaTeX. La valeur d'intervention se propage a
+        # tous les descendants, d'ou la notation potential-outcome Y_{X=x}. Nom cible
+        # groupe entre accolades : les noms (ex. `X_3`) contiennent deja un `_`, donc
+        # `X_3_{...}` serait un double-indice invalide en LaTeX.
+        do_sub = ", ".join(f"{var}={val}" for var, val in sorted(self.intervention.items()))
+        cond = ", ".join(f"{var}={val}" for var, val in sorted(obs.items()))
+        target_latex = f"{{{target_source}}}_{{{do_sub}}}"
+        return (
+            f"P\\left({target_latex} \\mid {cond}\\right)" if cond
+            else f"P\\left({target_latex}\\right)"
         )
-        copied.add_nodes_from(self.nodes())
-        copied.add_edges_from(self.edges())
-        copied.latents = set(self.latents)
-        for cpd in self.get_cpds():        # CPDs posees sur le SWIG, recopiees
-            copied.add_cpds(cpd.copy())
-        # Requete L2.25 stockee (generate_225), recopiee si presente.
-        copied.target = self.target
-        copied.observations = dict(self.observations) if self.observations is not None else None
-        copied.situation_initiale = (
-            dict(self.situation_initiale) if self.situation_initiale is not None else None
-        )
-        copied.swig_description = self.swig_description
-        return copied
 
 
 @dataclass
@@ -484,13 +301,15 @@ class SwigCounterfactualEngine:
     def __init__(self, swig: Swig, *, max_response_functions: Optional[int] = None):
         if swig.source_bn is None:
             raise ValueError("Le moteur exige swig.source_bn (le SCM source).")
-        if not swig.spec.interventions:
+        if not swig.intervention:
             raise ValueError("Le moteur exige un SWIG construit avec intervention(s).")
-        if swig.latents or getattr(swig.source_bn, "latents", set()):
+        if getattr(swig.source_bn, "latents", set()):
             raise ValueError("SCM markovien requis : pas de variable latente.")
         self.swig = swig
         self.source_bn = swig.source_bn
-        self.spec = swig.spec
+        # Le SWIG n'est que (source_bn, intervention) : on lit tout directement.
+        self.intervention: Dict[str, Any] = dict(swig.intervention)
+        self.source_nodes: List[str] = [str(n) for n in self.source_bn.nodes()]
         # Plafond d'enumeration : argument explicite sinon `config.max_response_functions`.
         self.max_response_functions = (
             max_response_functions
@@ -507,7 +326,7 @@ class SwigCounterfactualEngine:
         # regenerer l'espace des fonctions de reponse quand r225 appelle
         # compute_cbn_225 PUIS get_cot sur le meme moteur.
         self._response_tables_cache: Optional[List[Tuple[Dict[str, Any], float]]] = None
-        do_txt = ", ".join(f"{v}={x}" for v, x in sorted(self.spec.interventions.items()))
+        do_txt = ", ".join(f"{v}={x}" for v, x in sorted(self.intervention.items()))
         self.trace.append(
             f"Phase 1 (representation) : modele a fonctions de reponse construit sur "
             f"{len(self.mechanisms)} mecanismes ; intervention do({do_txt})."
@@ -515,7 +334,7 @@ class SwigCounterfactualEngine:
 
     def _build_response_functions(self) -> Dict[str, _Mechanism]:
         mech: Dict[str, _Mechanism] = {}
-        for var in self.spec.source_nodes:
+        for var in self.source_nodes:
             cpd = self.source_bn.get_cpds(var)
             parents = [str(p) for p in cpd.variables[1:]]
             parent_states = [list(cpd.state_names[p]) for p in cpd.variables[1:]]
@@ -535,10 +354,8 @@ class SwigCounterfactualEngine:
         return mech
 
     def _topological_order(self) -> List[str]:
-        graph = nx.DiGraph()
-        graph.add_nodes_from(self.spec.source_nodes)
-        graph.add_edges_from(self.spec.source_edges)
-        return list(nx.topological_sort(graph))
+        # Tri topologique lu DIRECTEMENT sur le SCM source (aucun graphe reconstruit).
+        return [str(n) for n in nx.topological_sort(self.source_bn)]
 
     def _prob(self, var: str, value: Any, parent_config: Mapping[str, Any]) -> float:
         """P(var = value | parents = parent_config), lue dans la CPD source."""
@@ -549,7 +366,7 @@ class SwigCounterfactualEngine:
         """Nombre de jeux de tables de reponse completes enumeres : produit, par
         noeud, du nombre de fonctions de reponse `k^(#configurations de parents)`."""
         size = 1
-        for var in self.spec.source_nodes:
+        for var in self.source_nodes:
             mech = self.mechanisms[var]
             size *= len(mech.states) ** len(mech.configs)
         return size
@@ -621,11 +438,11 @@ class SwigCounterfactualEngine:
 
     def _distribution_and_mass(self, target_source: str, evidence: Mapping[str, Any]) -> Tuple[Dict[Any, float], float]:
         """Coeur des phases 2-3 : renvoie (distribution contrefactuelle normalisee
-        de la cible, masse d'evidence P(evidence)). Conserve pour `get_cot`, seul
-        consommateur qui a besoin de la masse ; `query`/`answer` passent desormais
-        par `compute_cbn_225`. Meme machinerie de tables de reponse completes que
-        `compute_cbn_225` (garde-fou dans _iter_response_tables)."""
-        interventions = dict(self.spec.interventions)
+        de la cible, masse d'evidence P(evidence)). Consomme par `compute_cbn_225`
+        (qui complete/arrondit la distribution) et par `get_cot` appele seul (qui a
+        besoin de la masse `P(evidence)`). Machinerie de tables de reponse completes
+        (garde-fou dans `_iter_response_tables`)."""
+        interventions = dict(self.intervention)
         distribution: Dict[Any, float] = {}
         evidence_mass = 0.0
         for response_tables, weight in self._iter_response_tables():
@@ -650,19 +467,6 @@ class SwigCounterfactualEngine:
         )
         return normalized, evidence_mass
 
-    def query(self, target: Any, factual_evidence: Optional[Mapping[Any, Any]] = None) -> Dict[Any, float]:
-        """P(cible* | evidence factuelle) sous l'intervention du SWIG : distribution
-        {valeur: probabilite} normalisee. `target` et les cles de `factual_evidence`
-        peuvent etre des variables source ou des noeuds SWIG."""
-        # Option A : meme calcul que compute_cbn_225, on le reutilise directement.
-        # _distribution_and_mass n'est garde que pour get_cot (besoin de P(evidence)).
-        return self.compute_cbn_225(target, factual_evidence)
-
-    def answer(self,target: Any,factual_evidence: Optional[Mapping[Any, Any]] = None,*,target_state: Any = 1) -> float:
-        """REPONSE scalaire : P(cible* = `target_state` | evidence factuelle) sous
-        l'intervention du SWIG (la quantite a comparer dans une tache)."""
-        return self.compute_cbn_225(target, factual_evidence).get(target_state, 0.0)
-
     def get_cot(self,*,target_state: Any = 1,distribution: Optional[Mapping[Any, float]] = None,evidence_mass: Optional[float] = None,n_round: int = 6,) -> str:
         """Raisonnement pas-a-pas pour la requete L2.25 stockee sur le SWIG.
     
@@ -675,11 +479,13 @@ class SwigCounterfactualEngine:
             distribution, evidence_mass = self._distribution_and_mass(target_source,evidence)
             distribution = self._complete_distribution(target_source, distribution)
     
-        target_label = self.spec.random_of.get(target_source, target_source)
+        # Plus de label scinde : la cible EST la variable source ; le do(...) ci-dessous
+        # indique deja qu'on est dans le monde contrefactuel.
+        target_label = target_source
         answer = distribution.get(target_state, 0.0)
-    
+
         do_txt = ", ".join(
-            f"{v}={val}" for v, val in sorted(self.spec.interventions.items())
+            f"{v}={val}" for v, val in sorted(self.intervention.items())
         )
         ev_txt = ", ".join(
             f"{v}={val}" for v, val in sorted(evidence.items())
@@ -713,11 +519,10 @@ class SwigCounterfactualEngine:
 
     
     def _target_source(self, target: Any) -> str:
-        """Resout une cible (variable source OU noeud SWIG) vers sa variable source."""
+        """Verifie que la cible est bien une variable du SCM source (plus de labels
+        scindes : la cible est directement une variable source)."""
         t = str(target)
-        if t in self.spec.source_of:      # noeud SWIG -> variable source
-            return self.spec.source_of[t]
-        if t in self.spec.source_nodes:   # deja une variable source
+        if t in self.source_nodes:
             return t
         raise ValueError(f"Cible inconnue : {target!r}.")
 
@@ -728,6 +533,7 @@ class SwigCounterfactualEngine:
             source = self._target_source(key)
             normalized[source] = value
         return normalized
+
     def _stored_225_query(self) -> Tuple[str, Dict[str, Any]]:
         """Return the L2.25 query stored on the SWIG.
     
@@ -744,22 +550,21 @@ class SwigCounterfactualEngine:
         return target_source, evidence
 
     def query(self) -> Dict[Any, float]:
-    """Return only the distribution for the stored L2.25 query."""
-    distribution, _ = self.compute_cbn_225()
-    return distribution
-
+        """Return only the distribution for the stored L2.25 query."""
+        distribution, _ = self.compute_cbn_225()
+        return distribution
 
     def answer(self, *, target_state: Any = 1) -> float:
-    """Return only P(target = target_state) for the stored L2.25 query."""
-    distribution, _ = self.compute_cbn_225(target_state=target_state)
-    return distribution.get(target_state, 0.0)
+        """Return only P(target = target_state) for the stored L2.25 query."""
+        distribution, _ = self.compute_cbn_225(target_state=target_state)
+        return distribution.get(target_state, 0.0)
 
-
-    def _complete_distribution(self,target_source: str,distribution: Mapping[Any, float]) -> Dict[Any, float]:
-    """Add missing target states with probability 0.0."""
-    return {
-        state: distribution.get(state, 0.0)
-        for state in self.mechanisms[target_source].states}
+    def _complete_distribution(self, target_source: str, distribution: Mapping[Any, float]) -> Dict[Any, float]:
+        """Add missing target states with probability 0.0."""
+        return {
+            state: distribution.get(state, 0.0)
+            for state in self.mechanisms[target_source].states
+        }
 
 
     @staticmethod
@@ -798,14 +603,12 @@ class SwigCounterfactualEngine:
     
         return distribution, cot
 
-Swig.to_nl = to_nl_DBN
+# to_nl_DBN (description NL du SCM source) s'appuie sur la to_nl des CPDs.
 TabularCPD.to_nl = to_nl_CPD
 
 
 __all__ = [
     "Swig",
     "SwigConfig",
-    "SwigSpec",
-    "SwigNodeInfo",
     "SwigCounterfactualEngine",
 ]
