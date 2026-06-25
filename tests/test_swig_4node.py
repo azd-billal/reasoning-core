@@ -1,6 +1,7 @@
 from itertools import product
 import sys
 from pathlib import Path
+import pytest
 
 repo_root = Path.cwd().parent if Path.cwd().name == "notebooks" else Path.cwd()
 sys.path.insert(0, str(repo_root))
@@ -18,18 +19,17 @@ def make_bn(edges, cpds):
 
 
 def run_case(name, bn, interventions, target, factual_evidence, n_round=4):
-    swig = Swig.from_bn(bn, interventions)
-    assert swig.check_model()
-    engine = SwigCounterfactualEngine(swig, max_response_functions=2_000_000)
-    result = engine.query(target, factual_evidence, n_round=n_round)
+    assert bn.check_model()
+    swig = Swig(bn=bn)
+    swig.generate_225(intervention=interventions,target=target,observations=factual_evidence)
+    engine = swig.engine
+    result, _ = engine.compute_cbn_225()
     assert abs(sum(result.values()) - 1.0) < 1e-8
     print(f"\n=== {name} ===")
     print("Interventions:", interventions)
     print("Factual evidence:", factual_evidence)
-    print("Target SWIG node:", swig.random_node_for(target))
+    print("Target SWIG node:", target)
     print("Counterfactual distribution:", result)
-    print("P(evidence):", round(engine.last_evidence_probability, n_round))
-    print("Response-space size:", engine.response_space_size())
     print("Trace:")
     print("\n".join(engine.trace))
     return swig, engine, result
